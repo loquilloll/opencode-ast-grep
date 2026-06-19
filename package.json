@@ -1,0 +1,12 @@
+{
+  "name": "opencode-ast-grep",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "sandcastle": "tsx .sandcastle/main.ts"
+  },
+  "devDependencies": {
+    "@ai-hero/sandcastle": "latest",
+    "tsx": "latest"
+  }
+}
