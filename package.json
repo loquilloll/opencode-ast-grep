@@ -2,11 +2,33 @@
   "name": "opencode-ast-grep",
   "private": true,
   "type": "module",
+  "description": "ast-grep + aider-style repo-map tools for opencode (search, replace, scan, validate, map).",
   "scripts": {
-    "sandcastle": "tsx .sandcastle/main.ts"
+    "build": "tsc -p tsconfig.build.json && node scripts/copy-assets.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --experimental-strip-types test/ast-grep/smoke.ts && node --experimental-strip-types test/ast-grep-map/smoke.ts",
+    "test:ast-grep": "node --experimental-strip-types test/ast-grep/smoke.ts",
+    "test:ast-grep-map": "node --experimental-strip-types test/ast-grep-map/smoke.ts",
+    "sandcastle": "tsx .sandcastle/main.ts",
+    "sandcastle:run": "tsx .sandcastle/main.ts run",
+    "sandcastle:setup": "tsx .sandcastle/main.ts setup",
+    "sandcastle:plugins": "tsx .sandcastle/main.ts plugins",
+    "sandcastle:brew": "tsx .sandcastle/main.ts brew"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "1.17.8",
+    "tree-sitter": "^0.25.0",
+    "tree-sitter-cpp": "^0.23.4",
+    "tree-sitter-go": "^0.25.0",
+    "tree-sitter-javascript": "^0.25.0",
+    "tree-sitter-python": "^0.25.0",
+    "tree-sitter-rust": "^0.24.0",
+    "tree-sitter-typescript": "^0.23.2"
   },
   "devDependencies": {
     "@ai-hero/sandcastle": "latest",
-    "tsx": "latest"
+    "@types/node": "^22.19.21",
+    "tsx": "latest",
+    "typescript": "^5"
   }
 }

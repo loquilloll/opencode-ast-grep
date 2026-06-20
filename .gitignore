@@ -1,0 +1,20 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+
+# ast-grep-map persisted graph cache
+.ast-grep/
+
+# provisioned sg binary cache
+.opencode/runtime/
+
+# opencode auto-manages these for local plugins (regenerated on startup):
+.opencode/node_modules/
+.opencode/package.json
+.opencode/package-lock.json
+
+# logs
+*.log
+.sandcastle/logs/
