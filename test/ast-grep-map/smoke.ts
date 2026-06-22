@@ -1,6 +1,6 @@
 // Smoke + convergence tests for ast_grep_map.
 // Run: node --experimental-strip-types .opencode/ast-grep-map-tests/smoke.ts
-import { existsSync, readFileSync, statSync, mkdtempSync, writeFileSync, rmSync } from "node:fs"
+import { existsSync, readFileSync, statSync, mkdtempSync, writeFileSync, rmSync, mkdirSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import {
@@ -9,6 +9,7 @@ import {
   pageRank,
   renderTree,
   discoverCodeFiles,
+  resolveRoot,
   tools,
 } from "../../src/ast-grep-map/impl.ts"
 
@@ -23,6 +24,25 @@ function assert(cond: boolean, msg: string): void {
   } else {
     console.log("  ok:", msg)
   }
+}
+
+// --- Test 3b: resolveRoot falls back from a placeholder worktree to directory ---
+function testResolveRootFallback(): void {
+  console.log("[3b] resolveRoot fallback")
+  const placeholder = mkdtempSync(join(tmpdir(), "agmap-empty-"))
+  const project = mkdtempSync(join(tmpdir(), "agmap-project-"))
+  const otherProject = mkdtempSync(join(tmpdir(), "agmap-other-project-"))
+  mkdirSync(join(project, "src"), { recursive: true })
+  mkdirSync(join(otherProject, "src"), { recursive: true })
+  writeFileSync(join(project, "src", "index.ts"), "export function ok(): boolean { return true }\n")
+  writeFileSync(join(otherProject, "src", "index.ts"), "export function other(): boolean { return true }\n")
+  const root = resolveRoot({ worktree: placeholder, directory: project }, "ts")
+  assert(root === project, "uses directory when worktree has no supported files")
+  const outsideRoot = resolveRoot({ worktree: otherProject, directory: project }, "ts")
+  assert(outsideRoot === project, "uses directory when it is outside worktree")
+  rmSync(placeholder, { recursive: true, force: true })
+  rmSync(project, { recursive: true, force: true })
+  rmSync(otherProject, { recursive: true, force: true })
 }
 
 // --- Test 1: extractAllTags on a synthetic TS file ---
@@ -150,6 +170,7 @@ async function testJsonMode(): Promise<void> {
   await testExtract()
   testPageRank()
   await testRenderTree()
+  testResolveRootFallback()
   await testExecuteEndToEnd()
   await testJsonMode()
   console.log(failures === 0 ? "\nALL TESTS PASSED" : `\n${failures} TEST(S) FAILED`)

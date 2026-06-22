@@ -177,6 +177,8 @@ When using `sg` directly in a shell, **always single-quote patterns** so `$VAR` 
 
 A **native opencode tool** (no `sg` command, no helper subcommand). It produces an **aider-style repo map**: a compact outline of symbol declarations, each annotated with a GitHub-style line range (`L<n>` for one-liners, `L<start>-L<end>` for spans), ranked by **PageRank** so the most-referenced symbols surface first. The PageRank graph (files as nodes, reference→definition edges) is built from the whole worktree and **persisted to `<worktree>/.ast-grep/graph.json`**.
 
+On session startup the plugin also writes **`.ast-grep/REPORT.md`** — a markdown briefing derived from the same graph (god-node hubs, surprising cross-module edges, module dependency graph, orphaned defs, multi-definer ambiguity). Read it first when orienting in an unfamiliar repo. See [references/repo-briefing.md](references/repo-briefing.md) for what each section means and when to trust it.
+
 Use it to **orient in or prioritize work across a codebase** — "what's in this repo, what matters most, where does X live" — without reading every file. It is the structural analogue of `rg` for *understanding* a codebase rather than *finding text in* one.
 
 Symbol extraction uses tree-sitter with aider's verbatim `-tags.scm` queries. Supported languages: **ts, tsx, js, py, go, rs, cpp** (a subset of the 25 `sg` languages — map needs per-language tree-sitter grammars).

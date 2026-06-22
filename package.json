@@ -6,9 +6,10 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json && node scripts/copy-assets.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --experimental-strip-types test/ast-grep/smoke.ts && node --experimental-strip-types test/ast-grep-map/smoke.ts",
+    "test": "node --experimental-strip-types test/ast-grep/smoke.ts && node --experimental-strip-types test/ast-grep-map/smoke.ts && node --experimental-strip-types test/ast-grep-map/report.ts",
     "test:ast-grep": "node --experimental-strip-types test/ast-grep/smoke.ts",
     "test:ast-grep-map": "node --experimental-strip-types test/ast-grep-map/smoke.ts",
+    "test:ast-grep-map-report": "node --experimental-strip-types test/ast-grep-map/report.ts",
     "sandcastle": "tsx .sandcastle/main.ts",
     "sandcastle:run": "tsx .sandcastle/main.ts run",
     "sandcastle:setup": "tsx .sandcastle/main.ts setup",

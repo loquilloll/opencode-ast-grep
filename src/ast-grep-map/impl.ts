@@ -16,8 +16,11 @@
 // spawns that subprocess + builds the graph + PageRank + renders.
 
 import { spawn } from "node:child_process"
-import { readFileSync, readdirSync, statSync, existsSync, mkdirSync, writeFileSync, renameSync } from "node:fs"
-import { dirname, join, relative, resolve, sep } from "node:path"
+import { createHash } from "node:crypto"
+import { readFileSync, readdirSync, statSync, existsSync, mkdirSync, writeFileSync, renameSync, rmSync } from "node:fs"
+import { homedir } from "node:os"
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
+import { fileURLToPath } from "node:url"
 import { tool, type Plugin, type ToolContext } from "@opencode-ai/plugin"
 
 // ---------------------------------------------------------------------------
@@ -36,6 +39,21 @@ const LANGS: Record<string, string[]> = {
   cpp: [".cc", ".cpp", ".cxx", ".hpp", ".hxx", ".h"],
 }
 
+const LANG_ALIASES: Record<string, string> = {
+  ts: "typescript",
+  typescript: "typescript",
+  tsx: "tsx",
+  js: "javascript",
+  javascript: "javascript",
+  py: "python",
+  python: "python",
+  go: "go",
+  rs: "rust",
+  rust: "rust",
+  cpp: "cpp",
+  cplusplus: "cpp",
+}
+
 // PageRank / map defaults (networkx + aider defaults).
 const DAMPING = 0.85
 const MAX_ITER = 100
@@ -51,8 +69,8 @@ const GRAPH_FILE = "graph.json"
 
 // Directory names never descended into during file discovery.
 const IGNORE_DIRS = new Set([
-  "node_modules", ".git", ".hg", ".svn", ".ast-grep", "dist", "build",
-  "target", ".next", ".cache", "out", "vendor", ".venv", "venv",
+  "node_modules", ".git", ".hg", ".svn", ".ast-grep", ".opencode", ".sandcastle",
+  "dist", "build", "target", ".next", ".cache", "out", "vendor", ".venv", "venv",
   "__pycache__", ".mypy_cache", ".pytest_cache", "coverage",
 ])
 
@@ -65,6 +83,11 @@ function languageForFile(absPath: string): string | null {
     if (exts.some((e) => absPath.endsWith(e))) return lang
   }
   return null
+}
+
+function normalizeLangFilter(langFilter?: string): string | undefined {
+  if (!langFilter) return undefined
+  return LANG_ALIASES[langFilter.toLowerCase()] ?? langFilter.toLowerCase()
 }
 
 // ---------------------------------------------------------------------------
@@ -86,6 +109,7 @@ interface Tag {
 }
 
 const EXTRACT_SCRIPT_NAME = "extract.mjs"
+const EXTRACT_SCRIPT_INSTALLED_NAME = "ast-grep-map-extract.mjs"
 const EXTRACT_SCRIPT_REL = join("src", "ast-grep-map", EXTRACT_SCRIPT_NAME)
 const NODE_ENV_KEY = "OP_AST_GREP_MAP_NODE"
 const SCRIPT_ENV_KEY = "OP_AST_GREP_MAP_SCRIPT"
@@ -99,6 +123,11 @@ function resolveExtractScript(worktree: string): string | null {
   const envScript = process.env[SCRIPT_ENV_KEY]
   if (envScript && existsSync(envScript)) return envScript
   const candidates: string[] = []
+  try {
+    candidates.push(join(dirname(fileURLToPath(import.meta.url)), EXTRACT_SCRIPT_INSTALLED_NAME))
+  } catch {
+    /* import.meta.url is always available in opencode, but keep resolution best-effort. */
+  }
   let dir = worktree
   for (let i = 0; i < 12; i++) {
     candidates.push(join(dir, EXTRACT_SCRIPT_REL))
@@ -339,7 +368,7 @@ function pageRank(
 
 interface RankedTag { tag: Tag; rank: number }
 
-function rankDefinitions(graph: Graph, scores: Map<string, number>): RankedTag[] {
+function rankDefinitions(graph: Graph, scores: Map<string, number>, defTags: Tag[]): RankedTag[] {
   const rankedDefs = new Map<string, number>() // "dst\0ident" -> rank
   for (const e of graph.edges) {
     const srcRank = scores.get(e.src) ?? 0
@@ -352,7 +381,7 @@ function rankDefinitions(graph: Graph, scores: Map<string, number>): RankedTag[]
   // Resolve (dst, ident) -> def tags; pick the entries sorted desc by rank.
   // Build a lookup of (rel_fname, ident) -> def tags.
   const byKey = new Map<string, Tag[]>()
-  for (const tag of allDefTags()) {
+  for (const tag of defTags) {
     const key = `${tag.rel_fname}\0${tag.name}`
     let arr = byKey.get(key)
     if (!arr) {
@@ -375,13 +404,6 @@ function rankDefinitions(graph: Graph, scores: Map<string, number>): RankedTag[]
     if (tags) for (const t of tags) out.push({ tag: t, rank: e.rank })
   }
   return out
-}
-
-// Module-level bag of all def tags collected during the current build (so
-// rankDefinitions can resolve (file,ident) -> tags). Reset per build.
-let _allDefTags: Tag[] = []
-function allDefTags(): Tag[] {
-  return _allDefTags
 }
 
 // ---------------------------------------------------------------------------
@@ -485,6 +507,7 @@ function binarySearchTokenBudget(rankedTags: RankedTag[], maxTokens: number): st
 function discoverCodeFiles(root: string, langFilter?: string): string[] {
   const out: string[] = []
   const stack: string[] = [root]
+  const normalizedLang = normalizeLangFilter(langFilter)
   while (stack.length) {
     const dir = stack.pop()!
     let entries: string[]
@@ -507,7 +530,7 @@ function discoverCodeFiles(root: string, langFilter?: string): string[] {
       } else if (st.isFile()) {
         const lang = languageForFile(full)
         if (!lang) continue
-        if (langFilter && lang !== langFilter) continue
+        if (normalizedLang && lang !== normalizedLang) continue
         out.push(full)
       }
     }
@@ -570,7 +593,23 @@ function globMatch(pattern: string, path: string): boolean {
 function resolveMapDir(worktree: string): string {
   const override = process.env[MAP_DIR_ENV]
   if (override) return resolve(override)
-  return resolve(join(worktree, ".ast-grep"))
+  const worktreeMapDir = resolve(join(worktree, ".ast-grep"))
+  if (canWriteDir(worktreeMapDir)) return worktreeMapDir
+  const cacheRoot = process.env.XDG_CACHE_HOME || join(homedir(), ".cache")
+  const key = createHash("sha256").update(resolve(worktree)).digest("hex").slice(0, 16)
+  return resolve(join(cacheRoot, "opencode", "ast-grep-map", key))
+}
+
+function canWriteDir(dir: string): boolean {
+  const probe = join(dir, `.write-test-${process.pid}-${Date.now()}`)
+  try {
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(probe, "")
+    rmSync(probe, { force: true })
+    return true
+  } catch {
+    return false
+  }
 }
 
 interface PersistedGraph {
@@ -643,13 +682,36 @@ function loadPersisted(mapDir: string): PersistedGraph | null {
 // The tool
 // ---------------------------------------------------------------------------
 
-function resolveRoot(ctx: ToolContext): string {
-  // Prefer the git worktree root (whole-repo graphing), but opencode returns
-  // a bare separator ("/" or "\") for worktree when no git repo is present —
-  // not a usable project root. Fall back to the session directory.
-  const wt = ctx.worktree
-  if (wt && wt !== "/" && wt !== "\\" && wt !== sep) return wt
-  return ctx.directory || wt || "."
+function usableRoot(root: string | undefined): string | null {
+  if (!root || root === "/" || root === "\\" || root === sep) return null
+  return root
+}
+
+function isSameOrInside(child: string, parent: string): boolean {
+  const rel = relative(parent, child)
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))
+}
+
+function resolveRoot(ctx: Pick<ToolContext, "directory" | "worktree">, langFilter?: string): string {
+  // Prefer the git worktree root (whole-repo graphing), but opencode can report
+  // a placeholder worktree such as /home/agent/workspace while the active
+  // session directory is the real project. Use the first candidate that actually
+  // contains supported source files, then fall back to the historical ordering.
+  const wt = usableRoot(ctx.worktree)
+  const dir = usableRoot(ctx.directory)
+  const roots = wt && dir && !isSameOrInside(resolve(dir), resolve(wt)) ? [dir, wt] : [wt, dir]
+  const candidates = [...roots, "."].filter((r): r is string => Boolean(r))
+  const seen = new Set<string>()
+  const unique = candidates.filter((r) => {
+    const abs = resolve(r)
+    if (seen.has(abs)) return false
+    seen.add(abs)
+    return true
+  })
+  for (const root of unique) {
+    if (discoverCodeFiles(root, langFilter).length > 0) return root
+  }
+  return unique[0] ?? "."
 }
 
 const ast_grep_map = tool({
@@ -665,7 +727,7 @@ const ast_grep_map = tool({
     json: tool.schema.boolean().optional().describe("Return the persisted graph JSON instead of the rendered map."),
   },
   execute: async (args, ctx) => {
-    const worktree = resolveRoot(ctx)
+    const worktree = resolveRoot(ctx, args.lang)
     const refresh = args.refresh ?? "auto"
     const mapDir = resolveMapDir(worktree)
 
@@ -709,7 +771,7 @@ const ast_grep_map = tool({
     }
 
     // 5. Extract tags for every file via the node subprocess (one spawn).
-    _allDefTags = []
+    const defTags: Tag[] = []
     const defines = new Map<string, Set<string>>()
     const references = new Map<string, string[]>()
     let allTags: Tag[]
@@ -722,7 +784,7 @@ const ast_grep_map = tool({
     for (const t of allTags) {
       graphFiles.add(t.rel_fname)
       if (t.kind === "def") {
-        _allDefTags.push(t)
+        defTags.push(t)
         let s = defines.get(t.name)
         if (!s) {
           s = new Set()
@@ -758,7 +820,7 @@ const ast_grep_map = tool({
 
     // 7. PageRank + rank distribution.
     const scores = pageRank(graph, personalization, { alpha: DAMPING, max_iter: MAX_ITER, tol: TOL })
-    const ranked = rankDefinitions(graph, scores)
+    const ranked = rankDefinitions(graph, scores, defTags)
 
     // 8. Persist.
     const outFile = persistGraph(graph, scores, ranked, mapDir, { worktree, mentionedIdents: Array.from(mentionedIdents), sourceMtimes })
@@ -779,11 +841,579 @@ function formatResult(tree: string): string {
   return tree || "(no ranked symbols to display)"
 }
 
+// ---------------------------------------------------------------------------
+// Report generator — pure functions: PersistedGraph → markdown briefing.
+// ---------------------------------------------------------------------------
+// No I/O, no side effects. Sections mirror graphify's GRAPH_REPORT.md where
+// local-only computation permits:
+//   - God nodes / hubs (PageRank + distinct referencer count)
+//   - Surprising cross-module connections (high-weight edges across top-level dirs)
+//   - Module dependency graph (mermaid block, top-level dir coupling)
+//   - Orphan / under-referenced definitions (definers with only self-edges)
+//   - Multi-definer ambiguity (idents defined in >1 file)
+//
+// All relationships are EXTRACTED via AST; there is no inference step. The
+// multi-definer list is the closest thing to an "ambiguity" signal.
+
+const REPORT_TOP_N = 10
+const REPORT_MULTI_DEFINER_N = 15
+const REPORT_ORPHAN_SAMPLE_N = 5
+const REPORT_ORPHAN_TABLE_CAP = 20
+const REPORT_MAX_MODULE_EDGES = 30
+const REPORT_LOCK_STALE_MS = 5 * 60 * 1000
+const REPORT_FILE = "REPORT.md"
+const REPORT_TMP = "REPORT.md.tmp"
+const REPORT_LOCK_FILE = ".report.lock"
+const REPORT_LOG_FILE = "report.log"
+
+export interface Hub {
+  file: string
+  pagerank: number
+  distinctReferencers: number
+  topSymbols: Array<{ ident: string; rank: number }>
+}
+
+export interface SurprisingEdge {
+  src: string
+  dst: string
+  ident: string
+  weight: number
+  score: number
+  srcModule: string
+  dstModule: string
+}
+
+export interface OrphanFile {
+  file: string
+  defCount: number
+  sampleIdents: string[]
+}
+
+export interface MultiDefinerIdent {
+  ident: string
+  definerCount: number
+  files: string[]
+}
+
+export interface ReportOptions {
+  worktree?: string
+  topN?: number
+  multiDefinerN?: number
+  generatedAt?: string
+}
+
+// First path segment under worktree. Rel paths in graph.json may use either
+// POSIX or Windows separators depending on origin; normalize to POSIX before
+// splitting so the module label is stable across platforms.
+export function topDir(rel: string): string {
+  const posixRel = rel.replace(/\\/g, "/")
+  const idx = posixRel.indexOf("/")
+  return idx === -1 ? posixRel : posixRel.slice(0, idx)
+}
+
+// In-degree from unique non-self src files.
+function distinctReferencers(edges: GraphEdge[], file: string): number {
+  const set = new Set<string>()
+  for (const e of edges) {
+    if (e.dst === file && e.src !== file) set.add(e.src)
+  }
+  return set.size
+}
+
+export function topHubs(g: PersistedGraph, n: number = REPORT_TOP_N): Hub[] {
+  const symbolsByFile = new Map<string, Array<{ ident: string; rank: number }>>()
+  for (const rs of g.rankedSymbols) {
+    let arr = symbolsByFile.get(rs.file)
+    if (!arr) {
+      arr = []
+      symbolsByFile.set(rs.file, arr)
+    }
+    arr.push({ ident: rs.ident, rank: rs.rank })
+  }
+  const files = Object.keys(g.scores)
+  const hubs: Hub[] = files.map((file) => ({
+    file,
+    pagerank: g.scores[file] ?? 0,
+    distinctReferencers: distinctReferencers(g.edges, file),
+    topSymbols: (symbolsByFile.get(file) ?? [])
+      .slice()
+      .sort((a, b) => b.rank - a.rank)
+      .slice(0, 2),
+  }))
+  hubs.sort(
+    (a, b) =>
+      b.pagerank - a.pagerank ||
+      b.distinctReferencers - a.distinctReferencers ||
+      (a.file < b.file ? -1 : 1),
+  )
+  return hubs.slice(0, n)
+}
+
+export function surprisingConnections(g: PersistedGraph, n: number = REPORT_TOP_N): SurprisingEdge[] {
+  const pairCounts = new Map<string, number>()
+  const keyOf = (a: string, b: string) => `${a}\u0000${b}`
+  for (const e of g.edges) {
+    const ts = topDir(e.src)
+    const td = topDir(e.dst)
+    if (ts === td || e.src === e.dst) continue
+    const k = keyOf(ts, td)
+    pairCounts.set(k, (pairCounts.get(k) ?? 0) + 1)
+  }
+  const candidates: SurprisingEdge[] = []
+  for (const e of g.edges) {
+    const ts = topDir(e.src)
+    const td = topDir(e.dst)
+    if (ts === td || e.src === e.dst) continue
+    const total = pairCounts.get(keyOf(ts, td)) ?? 1
+    const score = e.weight * Math.log(1 + total)
+    candidates.push({
+      src: e.src,
+      dst: e.dst,
+      ident: e.ident,
+      weight: e.weight,
+      score,
+      srcModule: ts,
+      dstModule: td,
+    })
+  }
+  candidates.sort(
+    (a, b) => b.score - a.score || b.weight - a.weight || (a.src < b.src ? -1 : 1),
+  )
+  // Dedupe by (src, dst, ident) — the graph is a multigraph and parallel edges
+  // would otherwise dominate the top-N list.
+  const seen = new Set<string>()
+  const out: SurprisingEdge[] = []
+  for (const c of candidates) {
+    const k = `${c.src}\u0000${c.dst}\u0000${c.ident}`
+    if (seen.has(k)) continue
+    seen.add(k)
+    out.push(c)
+    if (out.length >= n) break
+  }
+  return out
+}
+
+export function moduleDependencyGraph(g: PersistedGraph, maxEdges: number = REPORT_MAX_MODULE_EDGES): string {
+  const weights = new Map<string, number>()
+  const keyOf = (a: string, b: string) => `${a}\u0000${b}`
+  for (const e of g.edges) {
+    const ts = topDir(e.src)
+    const td = topDir(e.dst)
+    if (ts === td) continue
+    const k = keyOf(ts, td)
+    weights.set(k, (weights.get(k) ?? 0) + e.weight)
+  }
+  const modules = new Set<string>()
+  for (const k of weights.keys()) {
+    const [a, b] = k.split("\u0000")
+    modules.add(a)
+    modules.add(b)
+  }
+  // mermaid id sanitizer (dir names are usually safe but be defensive).
+  const sanitize = (s: string) => s.replace(/[^A-Za-z0-9_]/g, "_")
+  const pairs = Array.from(weights.entries())
+    .map(([k, w]) => {
+      const [a, b] = k.split("\u0000")
+      return { a, b, w }
+    })
+    .sort((x, y) => y.w - x.w)
+    .slice(0, maxEdges)
+  const lines = ["```mermaid", "graph LR"]
+  for (const m of Array.from(modules).sort()) lines.push(`  ${sanitize(m)}["${m}"]`)
+  for (const p of pairs) {
+    lines.push(`  ${sanitize(p.a)} -->|w=${p.w.toFixed(1)}| ${sanitize(p.b)}`)
+  }
+  if (weights.size > pairs.length) {
+    lines.push(`  %% ${weights.size - pairs.length} more edges truncated`)
+  }
+  lines.push("```")
+  return lines.join("\n")
+}
+
+export function orphanDefs(g: PersistedGraph): OrphanFile[] {
+  // A file is "orphan" IFF it has at least one canonical self-loop (weight <= 0.1,
+  // src === dst — emitted by buildGraph for definers with zero referencers) AND
+  // no non-canonical incoming edges. Files with no incoming edges at all are NOT
+  // flagged — in real buildGraph output they would have received a self-loop,
+  // so absence of both means the file isn't an orphan pattern.
+  const defCounts = new Map<string, { count: number; idents: Set<string> }>()
+  for (const rs of g.rankedSymbols) {
+    let v = defCounts.get(rs.file)
+    if (!v) {
+      v = { count: 0, idents: new Set() }
+      defCounts.set(rs.file, v)
+    }
+    v.count++
+    v.idents.add(rs.ident)
+  }
+  const canonicalSelfLoop = new Set<string>()
+  const disqualified = new Set<string>()
+  for (const e of g.edges) {
+    if (e.src === e.dst) {
+      if (e.weight <= 0.1) canonicalSelfLoop.add(e.dst)
+      else disqualified.add(e.dst) // heavy self-loop
+      continue
+    }
+    disqualified.add(e.dst) // any real incoming edge
+  }
+  const out: OrphanFile[] = []
+  for (const [file, { count, idents }] of defCounts) {
+    if (disqualified.has(file)) continue
+    if (!canonicalSelfLoop.has(file)) continue
+    out.push({
+      file,
+      defCount: count,
+      sampleIdents: Array.from(idents).sort().slice(0, REPORT_ORPHAN_SAMPLE_N),
+    })
+  }
+  out.sort((a, b) => b.defCount - a.defCount || (a.file < b.file ? -1 : 1))
+  return out
+}
+
+export function multiDefiners(g: PersistedGraph, n: number = REPORT_MULTI_DEFINER_N): MultiDefinerIdent[] {
+  const byIdent = new Map<string, Set<string>>()
+  for (const rs of g.rankedSymbols) {
+    let s = byIdent.get(rs.ident)
+    if (!s) {
+      s = new Set()
+      byIdent.set(rs.ident, s)
+    }
+    s.add(rs.file)
+  }
+  const out: MultiDefinerIdent[] = []
+  for (const [ident, files] of byIdent) {
+    if (files.size > 1) {
+      out.push({ ident, definerCount: files.size, files: Array.from(files).sort() })
+    }
+  }
+  out.sort((a, b) => b.definerCount - a.definerCount || (a.ident < b.ident ? -1 : 1))
+  return out.slice(0, n)
+}
+
+export function generateReport(g: PersistedGraph, opts: ReportOptions = {}): string {
+  const topN = opts.topN ?? REPORT_TOP_N
+  const multiN = opts.multiDefinerN ?? REPORT_MULTI_DEFINER_N
+  const iso = opts.generatedAt ?? new Date().toISOString()
+  const worktreeLabel = g.worktree || opts.worktree || "(unknown worktree)"
+  const lines: string[] = []
+
+  lines.push(
+    `<!-- ast-grep-map report · generated ${iso} · all relationships EXTRACTED via AST (no INFERRED mass; the multi-definer list below is the only ambiguity signal). -->`,
+  )
+  lines.push("")
+  lines.push(`# Repo briefing — \`${worktreeLabel}\``)
+  lines.push("")
+  lines.push(
+    `_Auto-generated from the PageRank graph at \`.ast-grep/graph.json\`. ${g.nodeCount} files, ${g.edgeCount} edges._`,
+  )
+  lines.push("")
+
+  const hubs = topHubs(g, topN)
+  lines.push("## God nodes / hubs")
+  lines.push("")
+  lines.push("Files with the highest PageRank (entry points and central modules).")
+  lines.push("")
+  if (hubs.length === 0) {
+    lines.push("_No hubs found._")
+  } else {
+    lines.push("| File | PageRank | Distinct referencers | Top symbol |")
+    lines.push("|---|---:|---:|---|")
+    for (const h of hubs) {
+      const top = h.topSymbols[0]
+      const sym = top ? `\`${top.ident}\` (rank ${(top.rank * 1000).toFixed(2)}\u2030)` : "\u2014"
+      lines.push(`| \`${h.file}\` | ${h.pagerank.toFixed(4)} | ${h.distinctReferencers} | ${sym} |`)
+    }
+  }
+  lines.push("")
+
+  const surprising = surprisingConnections(g, topN)
+  lines.push("## Surprising cross-module connections")
+  lines.push("")
+  lines.push(
+    "High-weight edges between files in different top-level directories — non-obvious coupling ranked by `weight × ln(1 + module-pair edge count)`.",
+  )
+  lines.push("")
+  if (surprising.length === 0) {
+    lines.push("_No cross-module edges found._")
+  } else {
+    lines.push("| Score | Src | \u2192 Dst | Ident | Weight |")
+    lines.push("|---:|---|---|---|---:|")
+    for (const s of surprising) {
+      lines.push(
+        `| ${s.score.toFixed(2)} | \`${s.src}\` | \`${s.dst}\` | \`${s.ident}\` | ${s.weight.toFixed(2)} |`,
+      )
+    }
+  }
+  lines.push("")
+
+  lines.push("## Module dependency graph")
+  lines.push("")
+  lines.push("Top-level directory coupling, summed edge weights.")
+  lines.push("")
+  lines.push(moduleDependencyGraph(g))
+  lines.push("")
+
+  const orphans = orphanDefs(g)
+  lines.push("## Orphan / under-referenced definitions")
+  lines.push("")
+  lines.push(
+    "Files whose defined symbols have no incoming references (only canonical self-edges). Candidates for dead code or entry-point-only modules.",
+  )
+  lines.push("")
+  if (orphans.length === 0) {
+    lines.push("_No orphans found._")
+  } else {
+    lines.push("| File | Defs | Sample identifiers |")
+    lines.push("|---|---:|---|")
+    for (const o of orphans.slice(0, REPORT_ORPHAN_TABLE_CAP)) {
+      const sample = o.sampleIdents.map((i) => `\`${i}\``).join(", ")
+      lines.push(`| \`${o.file}\` | ${o.defCount} | ${sample} |`)
+    }
+    if (orphans.length > REPORT_ORPHAN_TABLE_CAP) {
+      lines.push(`_...and ${orphans.length - REPORT_ORPHAN_TABLE_CAP} more._`)
+    }
+  }
+  lines.push("")
+
+  const multi = multiDefiners(g, multiN)
+  lines.push("## Multi-definer ambiguity")
+  lines.push("")
+  lines.push(
+    "Identifiers defined in more than one file — symbol resolution is ambiguous without disambiguation.",
+  )
+  lines.push("")
+  if (multi.length === 0) {
+    lines.push("_No ambiguous identifiers found._")
+  } else {
+    lines.push("| Ident | Definers | Files |")
+    lines.push("|---|---:|---|")
+    for (const m of multi) {
+      const files = m.files.map((f) => `\`${f}\``).join(", ")
+      lines.push(`| \`${m.ident}\` | ${m.definerCount} | ${files} |`)
+    }
+  }
+  lines.push("")
+
+  lines.push("---")
+  lines.push("")
+  lines.push(
+    `_To force regeneration: delete \`.ast-grep/graph.json\` and restart opencode, or call \`ast_grep_map\` with \`refresh: "always"\`._`,
+  )
+
+  return lines.join("\n")
+}
+
+// ---------------------------------------------------------------------------
+// Background report refresh (session.created hook)
+// ---------------------------------------------------------------------------
+// Checks the persisted graph's mtime cache; rebuilds the graph if stale; writes
+// .ast-grep/REPORT.md atomically. All errors are caught and logged to
+// .ast-grep/report.log — the hook must never crash the plugin load.
+// Concurrency: PID lockfile at .ast-grep/.report.lock. Stale after 5 minutes.
+
+export type RefreshStatus = "fresh" | "rebuilt" | "skipped" | "failed"
+
+export interface RefreshResult {
+  status: RefreshStatus
+  error?: string
+  reportPath?: string
+}
+
+function reportLogLine(mapDir: string, msg: string): void {
+  try {
+    const line = `${new Date().toISOString()} ${msg}\n`
+    writeFileSync(join(mapDir, REPORT_LOG_FILE), line, { flag: "a" })
+  } catch {
+    /* never throw from logger */
+  }
+}
+
+function acquireReportLock(mapDir: string): boolean {
+  const lockPath = join(mapDir, REPORT_LOCK_FILE)
+  try {
+    if (existsSync(lockPath)) {
+      const raw = readFileSync(lockPath, "utf8").trim()
+      const [pidStr, tsStr] = raw.split("\u0000")
+      const ts = Number(tsStr)
+      if (Number.isFinite(ts) && Date.now() - ts < REPORT_LOCK_STALE_MS) {
+        return false // active lock held by another process
+      }
+    }
+    mkdirSync(mapDir, { recursive: true })
+    writeFileSync(lockPath, `${process.pid}\u0000${Date.now()}`)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function releaseReportLock(mapDir: string): void {
+  try {
+    const lockPath = join(mapDir, REPORT_LOCK_FILE)
+    if (existsSync(lockPath)) {
+      const raw = readFileSync(lockPath, "utf8").trim()
+      const [pidStr] = raw.split("\u0000")
+      if (pidStr === String(process.pid)) writeFileSync(lockPath, "")
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+function writeReportAtomic(mapDir: string, markdown: string): string {
+  const outPath = join(mapDir, REPORT_FILE)
+  const tmpPath = join(mapDir, REPORT_TMP)
+  mkdirSync(mapDir, { recursive: true })
+  writeFileSync(tmpPath, markdown)
+  try {
+    renameSync(tmpPath, outPath)
+  } catch {
+    writeFileSync(outPath, markdown) // rename can fail across devices
+  }
+  return outPath
+}
+
+function currentSourceMtimes(worktree: string): Record<string, number> {
+  const out: Record<string, number> = {}
+  const files = discoverCodeFiles(worktree)
+  for (const f of files) {
+    try {
+      out[relative(worktree, f)] = statSync(f).mtimeMs
+    } catch {
+      /* ignore */
+    }
+  }
+  return out
+}
+
+function mtimesUnchanged(persisted: PersistedGraph | null, current: Record<string, number>): boolean {
+  if (!persisted || !persisted.sourceMtimes) return false
+  const p = persisted.sourceMtimes
+  if (Object.keys(p).length !== Object.keys(current).length) return false
+  for (const k of Object.keys(current)) if (p[k] !== current[k]) return false
+  return true
+}
+
+// Mirrors the ast_grep_map tool's execute path with no scope focus: whole-repo
+// graph, uniform personalization, default ranking.
+async function rebuildGraphForReport(worktree: string, signal: AbortSignal): Promise<PersistedGraph> {
+  const allFiles = discoverCodeFiles(worktree)
+  if (allFiles.length === 0) throw new Error(`no supported code files under ${worktree}`)
+  const sourceMtimes: Record<string, number> = {}
+  for (const f of allFiles) {
+    try {
+      sourceMtimes[relative(worktree, f)] = statSync(f).mtimeMs
+    } catch {
+      /* ignore */
+    }
+  }
+  const allTags: Tag[] = await extractAllTags(worktree, allFiles, signal)
+  const defines = new Map<string, Set<string>>()
+  const references = new Map<string, string[]>()
+  const defTags: Tag[] = []
+  const graphFiles = new Set<string>()
+  for (const t of allTags) {
+    graphFiles.add(t.rel_fname)
+    if (t.kind === "def") {
+      defTags.push(t)
+      let s = defines.get(t.name)
+      if (!s) {
+        s = new Set()
+        defines.set(t.name, s)
+      }
+      s.add(t.rel_fname)
+    } else {
+      let arr = references.get(t.name)
+      if (!arr) {
+        arr = []
+        references.set(t.name, arr)
+      }
+      arr.push(t.rel_fname)
+    }
+  }
+  const graph = buildGraph({
+    defines,
+    references,
+    mentionedIdents: new Set(),
+    chatFiles: new Set(),
+    allFiles: Array.from(graphFiles),
+  })
+  const personalization = new Map<string, number>()
+  const base = 100 / Math.max(graph.nodes.length, 1)
+  for (const n of graph.nodes) personalization.set(n, base)
+  const scores = pageRank(graph, personalization, { alpha: DAMPING, max_iter: MAX_ITER, tol: TOL })
+  const ranked = rankDefinitions(graph, scores, defTags)
+  const mapDir = resolveMapDir(worktree)
+  persistGraph(graph, scores, ranked, mapDir, {
+    worktree,
+    mentionedIdents: [],
+    sourceMtimes,
+  })
+  const fresh = loadPersisted(mapDir)
+  if (!fresh) throw new Error("failed to read back persisted graph after rebuild")
+  return fresh
+}
+
+export async function maybeRefreshReport(
+  worktree: string,
+  opts: { force?: boolean; signal?: AbortSignal } = {},
+): Promise<RefreshResult> {
+  const mapDir = resolveMapDir(worktree)
+  try {
+    mkdirSync(mapDir, { recursive: true })
+  } catch {
+    /* may already exist */
+  }
+  if (!acquireReportLock(mapDir)) {
+    return { status: "skipped", reportPath: join(mapDir, REPORT_FILE) }
+  }
+  const signal = opts.signal ?? new AbortController().signal
+  try {
+    const persisted = loadPersisted(mapDir)
+    const current = currentSourceMtimes(worktree)
+    const unchanged = mtimesUnchanged(persisted, current)
+    const reportExists = existsSync(join(mapDir, REPORT_FILE))
+
+    if (!opts.force && unchanged && reportExists && persisted) {
+      return { status: "skipped", reportPath: join(mapDir, REPORT_FILE) }
+    }
+
+    const graph = opts.force || !persisted || !unchanged
+      ? await rebuildGraphForReport(worktree, signal)
+      : persisted
+
+    const markdown = generateReport(graph, { worktree })
+    const reportPath = writeReportAtomic(mapDir, markdown)
+    return {
+      status: persisted && reportExists ? "rebuilt" : "fresh",
+      reportPath,
+    }
+  } catch (e: any) {
+    const msg = e?.message || String(e)
+    reportLogLine(mapDir, `FAILED: ${msg}`)
+    return { status: "failed", error: msg }
+  } finally {
+    releaseReportLock(mapDir)
+  }
+}
+
 export const tools = { ast_grep_map }
 
-const astGrepMapPlugin: Plugin = async () => {
+const astGrepMapPlugin: Plugin = async (input) => {
   return {
     tool: tools,
+    event: async ({ event }) => {
+      if (event.type !== "session.created") return
+      // Fire-and-forget: do NOT await (session start must not block). Same
+      // pattern as ast-grep's sg-binary provisioning.
+      const worktree = resolveRoot(input)
+      const handle = setTimeout(() => {
+        maybeRefreshReport(worktree).catch(() => {
+          /* errors are logged inside maybeRefreshReport */
+        })
+      }, 0)
+      handle.unref()
+    },
   }
 }
 
@@ -800,8 +1430,16 @@ export {
   discoverCodeFiles,
   languageForFile,
   resolveExtractScript,
+  resolveMapDir,
+  resolveRoot,
+  loadPersisted,
+  persistGraph,
+  DAMPING,
+  MAX_ITER,
+  TOL,
   type Tag,
   type Graph,
   type GraphEdge,
   type RankedTag,
+  type PersistedGraph,
 }

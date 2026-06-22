@@ -74,6 +74,7 @@ ast-grep-skill/
 │   ├── recipes.md                 copy-paste patterns by language (TS/JS/Py/Go/Rust/...)
 │   ├── cli.md                     sg run / scan / test / new / lsp reference
 │   ├── yaml-rules.md              YAML rule schema (atomic / relational / composite / transform / fix)
+│   ├── repo-briefing.md           legend + provenance for the ast_grep_map REPORT.md
 │   └── sgconfig.md                project configuration (ruleDirs, testConfigs, utilDirs)
 ├── tests/
 │   ├── smoke.sh                   POSIX self-test
