@@ -123,7 +123,7 @@ async function testExecuteEndToEnd(): Promise<void> {
   assert(typeof result === "string" && result.length > 0, "execute returns non-empty string")
   assert(/\n  *L\d/.test(result), "map output contains L<line> range markers")
   assert(!result.includes("│") && !result.includes("⋮"), "map output uses compact outline (no │/⋮)")
-  assert(result.includes("src/ast-grep/impl.ts:"), "map output contains the scoped file header")
+  assert(result.includes("src/ast-grep/impl.ts:") || result.includes("src\\ast-grep\\impl.ts:"), "map output contains the scoped file header (platform-agnostic path separator)")
   const graphFile = join(tmpMap, "graph.json")
   assert(existsSync(graphFile), "graph.json written to disk")
   const persisted = JSON.parse(readFileSync(graphFile, "utf8"))

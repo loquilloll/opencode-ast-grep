@@ -6,7 +6,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json && node scripts/copy-assets.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "tsx test/ast-grep/smoke.ts && tsx test/ast-grep/truncation.ts && tsx test/ast-grep-map/smoke.ts && tsx test/ast-grep-map/report.ts && tsx test/ast-grep-map/graph-store.ts && tsx test/ast-grep-map/graph-lifecycle.ts && tsx test/ast-grep-map/ppr.ts && tsx test/ast-grep-map/ppr-wiring.ts && tsx test/ast-grep-map/compose-hooks.ts && tsx test/ast-grep-map/symlink.ts",
+    "test": "tsx test/ast-grep/smoke.ts && tsx test/ast-grep/truncation.ts && tsx test/ast-grep-map/smoke.ts && tsx test/ast-grep-map/report.ts && tsx test/ast-grep-map/graph-store.ts && tsx test/ast-grep-map/graph-lifecycle.ts && tsx test/ast-grep-map/ppr.ts && tsx test/ast-grep-map/ppr-wiring.ts && tsx test/ast-grep-map/cache-hit-scoped.ts && tsx test/ast-grep-map/compose-hooks.ts && tsx test/ast-grep-map/symlink.ts",
     "test:ast-grep": "tsx test/ast-grep/smoke.ts",
     "test:ast-grep-truncation": "tsx test/ast-grep/truncation.ts",
     "test:ast-grep-map": "tsx test/ast-grep-map/smoke.ts",

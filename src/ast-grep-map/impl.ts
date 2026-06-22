@@ -825,6 +825,12 @@ const ast_grep_map = tool({
         tag: rankedSymbolToTag(r),
         rank: r.rank,
       }))
+      // Reconstruct defTags (the input to rankDefinitions) from the cache's
+      // rankedSymbols. Without this, applyScopeScores would receive an empty
+      // defTags array and return an empty re-ranking — the cache-hit scoped
+      // path would render "(no ranked symbols to display)" even on a fully
+      // populated cache. Each ranked symbol's tag IS a def tag (kind: "def").
+      const cachedDefTags: Tag[] = rankedUniform.map((rt) => rt.tag)
       // Reconstruct a minimal Graph object sufficient for applyScopeScores
       // (which only needs .nodes and .edges + .outWeight). The cache stores
       // them; outWeight is recomputed from edges cheaply.
@@ -833,9 +839,9 @@ const ast_grep_map = tool({
         edges: persisted.worktreeGraph.graph.edges,
         outWeight: computeOutWeight(persisted.worktreeGraph.graph.edges),
       }
-      const ranked = await applyScopedRanking(worktree, cachedGraph, [], rankedUniform, args)
+      const ranked = await applyScopedRanking(worktree, cachedGraph, cachedDefTags, rankedUniform, args)
       const maxTokens = (args.max_tokens ?? DEFAULT_MAX_TOKENS) * (scopeGiven ? 1 : MAP_MUL_NO_FILES)
-      if (args.json) return JSON.stringify(cacheToGraphView(persisted), null, 2)
+      if (args.json) return JSON.stringify(persisted, null, 2)
       const tree = binarySearchTokenBudget(ranked, maxTokens)
       return formatResult(tree)
     }
@@ -858,7 +864,7 @@ const ast_grep_map = tool({
       Array.from(mentionedIdents),
     )
     if (args.json) {
-      return JSON.stringify(cacheToGraphView(cache), null, 2)
+      return JSON.stringify(cache, null, 2)
     }
 
     // 8. Now layer the scope-aware PPR ranking on top of the freshly persisted
