@@ -7,13 +7,8 @@ dist/
 # ast-grep-map persisted graph cache
 .ast-grep/
 
-# provisioned sg binary cache
-.opencode/runtime/
-
-# opencode auto-manages these for local plugins (regenerated on startup):
-.opencode/node_modules/
-.opencode/package.json
-.opencode/package-lock.json
+# opencode local working dir (plugin shim, runtime, node_modules, etc. — installed/generated, not tracked)
+.opencode/
 
 # opencode session plans (ephemeral scratch)
 docs/plans/
