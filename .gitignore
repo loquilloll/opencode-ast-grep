@@ -15,6 +15,9 @@ dist/
 .opencode/package.json
 .opencode/package-lock.json
 
+# opencode session plans (ephemeral scratch)
+docs/plans/
+
 # sandcastle
 .sandcastle/
 
