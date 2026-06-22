@@ -127,12 +127,14 @@ async function testExecuteEndToEnd(): Promise<void> {
   const graphFile = join(tmpMap, "graph.json")
   assert(existsSync(graphFile), "graph.json written to disk")
   const persisted = JSON.parse(readFileSync(graphFile, "utf8"))
-  assert(persisted.version === 1, "persisted graph version=1")
-  assert(persisted.nodeCount > 0, "persisted nodeCount > 0")
-  assert(persisted.edgeCount > 0, `persisted edgeCount > 0 (got ${persisted.edgeCount})`)
-  assert(Array.isArray(persisted.rankedSymbols) && persisted.rankedSymbols.length > 0, "rankedSymbols populated")
-  const scoreSum = Object.values<number>(persisted.scores).reduce((a, b) => a + b, 0)
+  // v2 schema: top-level shape is { version, worktreeGraph: { graph: { nodes, edges }, ... } }
+  assert(persisted.version === 2, "persisted cache version=2")
+  assert(persisted.worktreeGraph?.graph?.nodes?.length > 0, "persisted worktreeGraph.graph.nodes populated")
+  assert(persisted.worktreeGraph?.graph?.edges?.length > 0, `persisted worktreeGraph.graph.edges > 0`)
+  assert(Array.isArray(persisted.worktreeGraph?.rankedSymbols) && persisted.worktreeGraph.rankedSymbols.length > 0, "rankedSymbols populated")
+  const scoreSum = Object.values<number>(persisted.worktreeGraph?.scores ?? {}).reduce((a, b) => a + b, 0)
   assert(Math.abs(scoreSum - 1) < 1e-3, `persisted scores sum ~1 (got ${scoreSum.toFixed(4)})`)
+  assert(Array.isArray(persisted.worktreeGraph?.sourceManifest), "sourceManifest array present")
 
   // refresh:auto must reuse the cache (graph.json not rewritten) when sources unchanged.
   const mtimeBefore = statSync(graphFile).mtimeMs
@@ -160,7 +162,10 @@ async function testJsonMode(): Promise<void> {
   } catch {
     /* fail below */
   }
-  assert(parsed !== null && parsed.nodes && parsed.edges, "json mode returns parseable graph with nodes+edges")
+  assert(
+    parsed !== null && parsed.worktreeGraph?.graph?.nodes && parsed.worktreeGraph?.graph?.edges,
+    "json mode returns parseable graph with worktreeGraph.graph.nodes+edges",
+  )
   delete process.env.OP_AST_GREP_MAP_DIR
   rmSync(tmpMap, { recursive: true, force: true })
 }

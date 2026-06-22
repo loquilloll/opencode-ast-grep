@@ -37,12 +37,9 @@ function assert(cond: boolean, msg: string): void {
 // Ident `sharedSym` is defined in BOTH src/a.ts and src/b.ts (multi-definer).
 function syntheticGraph(): PersistedGraph {
   return {
-    version: 1,
+    version: 2,
     worktree: "/repo",
     generatedAt: new Date().toISOString(),
-    damping: 0.85,
-    maxIter: 100,
-    tol: 1e-6,
     nodeCount: 4,
     edgeCount: 5,
     nodes: ["src/a.ts", "src/b.ts", "cmd/c.ts", "cmd/d.ts"],
@@ -73,7 +70,7 @@ function syntheticGraph(): PersistedGraph {
       { file: "cmd/d.ts", ident: "unusedFn", rank: 0.005, line: 1, endLine: 1, decl: "function unusedFn()" },
     ],
     mentionedIdents: [],
-    sourceMtimes: {},
+    sourceManifest: [],
   }
 }
 

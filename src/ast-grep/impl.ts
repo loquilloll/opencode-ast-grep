@@ -110,6 +110,9 @@ const DEFAULT_DOWNLOAD_TIMEOUT_MS = 60_000
 const MAX_DISPLAY_MATCHES = 50
 const MAX_JSON_MATCHES = 500
 const MAX_PREVIEW_LEN = 200
+// Improvement #5: byte-precise stdout/stderr cap. SIGTERM the child once the
+// cap is exceeded so the opencode process is not stuck draining a runaway sg.
+const DEFAULT_MAX_OUTPUT_BYTES = 1 * 1024 * 1024
 
 // ---------------------------------------------------------------------------
 // 3. Slug helpers
@@ -629,13 +632,50 @@ export interface SgResult {
   readonly stdout: string
   readonly stderr: string
   readonly timedOut: boolean
+  readonly truncated: boolean
+  readonly truncatedReason?: "max_output_bytes"
+}
+
+// Append `chunk` to `current` while keeping the total under `maxBytes`. Uses
+// binary search on UTF-8 byte length so we never split a multi-byte codepoint.
+// Returns { value, exceeded } where `exceeded` flags that the chunk had to be
+// truncated. Ported from the sibling impl's `appendWithCap`.
+export function appendWithCap(current: string, chunk: string, maxBytes: number): { value: string; exceeded: boolean } {
+  const currentBytes = Buffer.byteLength(current)
+  if (currentBytes >= maxBytes) {
+    return { value: current, exceeded: true }
+  }
+  const remainingBytes = maxBytes - currentBytes
+  const chunkBytes = Buffer.byteLength(chunk)
+  if (chunkBytes <= remainingBytes) {
+    return { value: current + chunk, exceeded: false }
+  }
+  // Find the largest UTF-8-safe slice of `chunk` that fits in `remainingBytes`.
+  let low = 0
+  let high = chunk.length
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2)
+    const slice = chunk.slice(0, mid)
+    if (Buffer.byteLength(slice) <= remainingBytes) {
+      low = mid
+    } else {
+      high = mid - 1
+    }
+  }
+  return { value: current + chunk.slice(0, low), exceeded: true }
 }
 
 export function runProcess(
   binary: string,
   args: readonly string[],
-  opts: { readonly cwd: string; readonly timeoutMs: number; readonly signal?: AbortSignal },
+  opts: {
+    readonly cwd: string
+    readonly timeoutMs: number
+    readonly signal?: AbortSignal
+    readonly maxOutputBytes?: number
+  },
 ): Promise<SgResult> {
+  const maxBytes = opts.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES
   return new Promise((resolveFn) => {
     const child = spawn(binary, args as string[], { cwd: opts.cwd, stdio: ["ignore", "pipe", "pipe"] })
     child.stdout?.setEncoding("utf8")
@@ -644,13 +684,34 @@ export function runProcess(
     let stderr = ""
     let timedOut = false
     let settled = false
+    let killedForOutputCap = false
 
-    child.stdout?.on("data", (chunk: string) => {
-      stdout += chunk
-    })
-    child.stderr?.on("data", (chunk: string) => {
-      stderr += chunk
-    })
+    const onStdout = (chunk: string) => {
+      const next = appendWithCap(stdout, chunk, maxBytes)
+      stdout = next.value
+      if (next.exceeded && !killedForOutputCap) {
+        killedForOutputCap = true
+        try {
+          child.kill("SIGTERM")
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    const onStderr = (chunk: string) => {
+      const next = appendWithCap(stderr, chunk, maxBytes)
+      stderr = next.value
+      if (next.exceeded && !killedForOutputCap) {
+        killedForOutputCap = true
+        try {
+          child.kill("SIGTERM")
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    child.stdout?.on("data", onStdout)
+    child.stderr?.on("data", onStderr)
 
     const timer = setTimeout(() => {
       timedOut = true
@@ -679,7 +740,14 @@ export function runProcess(
       settled = true
       clearTimeout(timer)
       if (signal) signal.removeEventListener("abort", onAbort)
-      resolveFn({ code, stdout, stderr, timedOut })
+      resolveFn({
+        code,
+        stdout,
+        stderr,
+        timedOut,
+        truncated: killedForOutputCap,
+        truncatedReason: killedForOutputCap ? "max_output_bytes" : undefined,
+      })
     }
 
     child.on("error", (err: Error) => {
@@ -745,6 +813,123 @@ export function parseCompactJson(text: string): SgMatch[] {
   }
 }
 
+// Improvement #5: structured parse with truncation status + JSON bracket-repair.
+// When the output was externally truncated (SIGTERM-on-cap), the trailing JSON
+// is likely partial. We first try a strict JSON.parse; on failure we attempt a
+// `lastIndexOf("},")` repair to recover the matches that completed before the
+// truncation point.
+export type SgParseResult = {
+  matches: SgMatch[]
+  totalMatches: number
+  truncated: boolean
+  truncatedReason?: "max_matches" | "max_output_bytes"
+  repairUsed: boolean
+}
+
+export function parseCompactJsonWithStatus(
+  text: string,
+  externallyTruncated: boolean,
+  opts: { maxMatches?: number } = {},
+): SgParseResult {
+  const trimmed = text.trim()
+  const cap = opts.maxMatches ?? MAX_JSON_MATCHES
+  if (!trimmed) {
+    return { matches: [], totalMatches: 0, truncated: externallyTruncated, repairUsed: false }
+  }
+
+  let matches: SgMatch[] = []
+  let repairUsed = false
+
+  try {
+    const data = JSON.parse(trimmed)
+    if (Array.isArray(data)) {
+      matches = data as SgMatch[]
+    }
+  } catch {
+    // Bracket-repair: recover complete objects from truncated JSON.
+    // Two strategies, simple-first then conservative:
+    //   (a) Trim back to the last `}` and append `]`. This handles the common
+    //       case where truncation lands right after a complete object's `}`.
+    //   (b) Trim back to the last `},` (inter-object separator) and append `]`.
+    //       This handles the mid-object truncation case where `}` belongs to a
+    //       nested value (e.g. the `range` sub-object) and the outer object is
+    //       incomplete. Strategy (a) would produce unbalanced braces here.
+    // We try (a) first because it's the more common case AND recovers more
+    // matches; (b) is the conservative fallback.
+    if (externallyTruncated) {
+      const lastClosed = trimmed.lastIndexOf("}")
+      if (lastClosed > 0) {
+        // Strategy (a): simple close+bracket. Recovers all complete objects.
+        const simpleRepair = `${trimmed.substring(0, lastClosed + 1)}]`
+        try {
+          const data = JSON.parse(simpleRepair)
+          if (Array.isArray(data)) {
+            matches = data as SgMatch[]
+            repairUsed = true
+          }
+        } catch {
+          /* simple repair didn't parse — try conservative */
+        }
+        // Strategy (b): conservative trim-to-`,`.
+        if (matches.length === 0) {
+          const bracketIdx = trimmed.lastIndexOf("},", lastClosed)
+          if (bracketIdx > 0) {
+            const conservativeRepair = `${trimmed.substring(0, bracketIdx + 1)}]`
+            try {
+              const data = JSON.parse(conservativeRepair)
+              if (Array.isArray(data)) {
+                matches = data as SgMatch[]
+                repairUsed = true
+              }
+            } catch {
+              /* fall through to line salvage */
+            }
+          }
+        }
+      }
+    }
+    // Line-by-line salvage (catches unusual multi-line shapes). Gated on
+    // externallyTruncated for safety: sg's --json=compact emits a single line,
+    // so ungated salvage would be dead code today. If sg changes its output
+    // shape, this remains a useful fallback.
+    if (matches.length === 0 && externallyTruncated) {
+      for (const rawLine of trimmed.split(/\r?\n/)) {
+        const line = rawLine.trim().replace(/,+$/, "")
+        if (!line.startsWith("{")) continue
+        try {
+          const obj = JSON.parse(line)
+          if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+            matches.push(obj as SgMatch)
+            repairUsed = true
+          }
+        } catch {
+          /* skip */
+        }
+      }
+    }
+  }
+
+  const totalMatches = matches.length
+  const matchesTruncated = totalMatches > cap
+  const finalMatches = matchesTruncated ? matches.slice(0, cap) : matches
+  const truncated = externallyTruncated || matchesTruncated
+  // Reason precedence: max_output_bytes is the root cause when set (it caused
+  // the JSON parse failure that triggered salvage + may also have triggered the
+  // secondary cap); surface it so the user knows to narrow the query.
+  const truncatedReason = externallyTruncated
+    ? "max_output_bytes"
+    : matchesTruncated
+      ? "max_matches"
+      : undefined
+  return {
+    matches: finalMatches,
+    totalMatches,
+    truncated,
+    truncatedReason,
+    repairUsed,
+  }
+}
+
 function firstLine(value: string): string {
   const idx = value.indexOf("\n")
   return idx === -1 ? value : value.slice(0, idx)
@@ -785,6 +970,24 @@ export function formatMatches(matches: readonly SgMatch[], showReplacement: bool
     }
   }
   return lines.join("\n")
+}
+
+// Format a structured parse result with a leading `[TRUNCATED]` block when
+// applicable. Improvement #5: surfaces the truncation reason to the caller.
+export function formatSgResult(parsed: SgParseResult, showReplacement: boolean): string {
+  const blocks: string[] = []
+  if (parsed.truncated) {
+    const reason =
+      parsed.truncatedReason === "max_matches"
+        ? `showing first ${parsed.matches.length} of ${parsed.totalMatches}`
+        : parsed.truncatedReason === "max_output_bytes"
+          ? "output exceeded 1MB limit"
+          : "results truncated"
+    blocks.push(`[TRUNCATED] Results truncated (${reason})`)
+    blocks.push("")
+  }
+  blocks.push(formatMatches(parsed.matches, showReplacement))
+  return blocks.join("\n")
 }
 
 function matchFileCount(matches: readonly SgMatch[]): number {
@@ -840,20 +1043,31 @@ const ast_grep_search = tool({
     const res = await runSgRun(got.binary, sgArgs, { cwd, signal: ctx.abort })
     if (!res.ok) return sgRunError(res)
 
-    const matches = parseCompactJson(res.stdout)
+    const parsed = parseCompactJsonWithStatus(res.stdout, res.truncated)
 
     if (args.json) {
-      const total = matches.length
-      const shown = matches.slice(0, MAX_JSON_MATCHES)
-      const note = total > MAX_JSON_MATCHES ? `\n... (${total} matches total, showing first ${MAX_JSON_MATCHES})` : ""
+      const shown = parsed.matches.slice(0, MAX_JSON_MATCHES)
+      const note = parsed.totalMatches > MAX_JSON_MATCHES ? `\n... (${parsed.totalMatches} matches total, showing first ${MAX_JSON_MATCHES})` : ""
       return `${JSON.stringify(shown)}${note}`
     }
 
-    const total = matches.length
-    if (total === 0) return "(no matches)"
-    const shown = matches.slice(0, MAX_DISPLAY_MATCHES)
-    const note = total > MAX_DISPLAY_MATCHES ? `\n(showing first ${MAX_DISPLAY_MATCHES} of ${total} matches)` : ""
-    return `${formatMatches(shown, false)}${note}`
+    if (parsed.matches.length === 0 && !parsed.truncated) return "(no matches)"
+    // Apply the display cap on top of the JSON cap so even un-bounded searches
+    // stay readable in the opencode UI. formatSgResult already prepends a
+    // `[TRUNCATED] showing first N of M` block, so no separate suffix here.
+    const displayMatches =
+      parsed.matches.length > MAX_DISPLAY_MATCHES ? parsed.matches.slice(0, MAX_DISPLAY_MATCHES) : parsed.matches
+    const displayTruncation = parsed.matches.length > MAX_DISPLAY_MATCHES
+    const displayParsed: SgParseResult = displayTruncation
+      ? {
+          matches: displayMatches,
+          totalMatches: parsed.totalMatches,
+          truncated: true,
+          truncatedReason: "max_matches",
+          repairUsed: parsed.repairUsed,
+        }
+      : parsed
+    return formatSgResult(displayParsed, false)
   },
 })
 
@@ -903,20 +1117,27 @@ const ast_grep_replace = tool({
     const pass1 = await runSgRun(got.binary, [...base, "--json=compact", ...paths], { cwd, signal: ctx.abort })
     if (!pass1.ok) return sgRunError(pass1)
 
-    const matches = parseCompactJson(pass1.stdout)
-    if (matches.length === 0) return "(no matches; nothing to replace.)"
-
-    const fileCount = matchFileCount(matches)
+    const parsed = parseCompactJsonWithStatus(pass1.stdout, pass1.truncated)
+    if (parsed.matches.length === 0 && !parsed.truncated) return "(no matches; nothing to replace.)"
+    const fileCount = matchFileCount(parsed.matches)
     if (!args.apply) {
-      const shown = matches.slice(0, MAX_DISPLAY_MATCHES)
-      const note = matches.length > MAX_DISPLAY_MATCHES ? `\n(showing first ${MAX_DISPLAY_MATCHES} of ${matches.length} matches)` : ""
-      return `DRY-RUN: would rewrite ${matches.length} match(es) across ${fileCount} file(s):\n${formatMatches(shown, true)}${note}\n\nRe-run with apply=true to mutate files.`
+      const shown = parsed.matches.slice(0, MAX_DISPLAY_MATCHES)
+      const displayTruncation = parsed.matches.length > MAX_DISPLAY_MATCHES
+      const truncatedHeader = parsed.truncated
+        ? `[${
+            parsed.truncatedReason === "max_output_bytes" ? "TRUNCATED output exceeded 1MB" : "TRUNCATED"
+          }] Showing a partial preview of the would-be changes.\n\n`
+        : ""
+      const note = displayTruncation ? `\n(showing first ${MAX_DISPLAY_MATCHES} of ${parsed.totalMatches} matches)` : ""
+      return `${truncatedHeader}DRY-RUN: would rewrite ${parsed.totalMatches} match(es) across ${fileCount} file(s):\n${formatMatches(shown, true)}${note}\n\nRe-run with apply=true to mutate files.`
     }
 
     // Pass 2: apply with --update-all (never combine with --json).
     const pass2 = await runSgRun(got.binary, [...base, "--update-all", ...paths], { cwd, signal: ctx.abort })
     if (!pass2.ok) return sgRunError(pass2)
-    return `APPLIED: rewrote ${matches.length} match(es) across ${fileCount} file(s).`
+    return `APPLIED: rewrote ${parsed.totalMatches} match(es) across ${fileCount} file(s).${
+      parsed.truncated ? "\n\nNote: pass-1 output was truncated; this count may be lower than the true total. Re-run ast_grep_search after the apply to verify." : ""
+    }`
   },
 })
 
@@ -956,6 +1177,10 @@ const ast_grep_scan = tool({
     if (res.code === -1) return `ast-grep scan failed to run.${res.stderr.trim() ? `\n${res.stderr.trim()}` : ""}`
 
     const parts: string[] = []
+    // Surface byte-cap truncation so the user knows scan output is partial.
+    if (res.truncated) {
+      parts.push("[TRUNCATED] Scan output exceeded 1MB limit — results may be incomplete.")
+    }
     const stdout = res.stdout.trim()
     if (stdout) parts.push(stdout)
     if (res.stderr.trim()) parts.push(`stderr:\n${res.stderr.trim()}`)

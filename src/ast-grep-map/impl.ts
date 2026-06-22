@@ -16,12 +16,65 @@
 // spawns that subprocess + builds the graph + PageRank + renders.
 
 import { spawn } from "node:child_process"
-import { createHash } from "node:crypto"
-import { readFileSync, readdirSync, statSync, existsSync, mkdirSync, writeFileSync, renameSync, rmSync } from "node:fs"
-import { homedir } from "node:os"
+import { readFileSync, readdirSync, lstatSync, existsSync, mkdirSync, writeFileSync, renameSync } from "node:fs"
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 import { tool, type Plugin, type ToolContext } from "@opencode-ai/plugin"
+import {
+  buildGraph as buildGraphImpl,
+  pageRank as pageRankImpl,
+  rankDefinitions as rankDefinitionsImpl,
+  isMeaningfulName,
+  deriveScopedFileScores,
+  isFileInScope,
+  isSeedPathSymlink,
+  matchesScopeGlobs,
+  normalizeEffectiveScope,
+  normalizeRelativePath,
+  normalizeSeedEntries,
+  type EffectiveScope,
+  type Graph as GraphT,
+  type GraphEdge as GraphEdgeT,
+  type BuildInput,
+  type RankedTag as RankedTagT,
+  type SeedEntry,
+  type Tag,
+} from "./graph.js"
+import {
+  buildInitialCache,
+  captureSourceManifest,
+  manifestsEqual,
+  readPersistedGraphCache,
+  rankedSymbolToTag,
+  resolveMapDir,
+  writePersistedGraphCache,
+  type PersistedCache,
+  type PersistedWorktreeGraph,
+  type SourceManifestEntry,
+} from "./graph-store.js"
+import {
+  getScopedRankSnapshot,
+  getWorktreeGraphCache,
+  initializeGraphPlugin,
+  markStaleForPath,
+  persistScopedRankSnapshot,
+  setWorktreeGraphCache,
+} from "./graph-service.js"
+
+// Re-export cache-layer symbols used by callers/tests.
+export {
+  resolveMapDir,
+  readPersistedGraphCache,
+  writePersistedGraphCache,
+  buildInitialCache,
+  initializeGraphPlugin,
+  markStaleForPath,
+  setWorktreeGraphCache,
+  getWorktreeGraphCache,
+  type PersistedCache,
+  type PersistedWorktreeGraph,
+  type SourceManifestEntry,
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -64,8 +117,8 @@ const LINE_TRUNC = 100
 const CHARS_PER_TOKEN = 4 // token proxy (no model tokenizer available)
 const OK_ERR = 0.15 // early-stop tolerance in binary search
 
-const MAP_DIR_ENV = "OP_AST_GREP_MAP_DIR"
-const GRAPH_FILE = "graph.json"
+// `MAP_DIR_ENV` ("OP_AST_GREP_MAP_DIR") and `GRAPH_FILE` ("graph.json") moved
+// to ./graph-store.ts. The cache-layer module owns all cache I/O.
 
 // Directory names never descended into during file discovery.
 const IGNORE_DIRS = new Set([
@@ -98,15 +151,9 @@ function normalizeLangFilter(langFilter?: string): string | undefined {
 // tree-sitter's native N-API addons). We feed it absolute file paths via stdin
 // and read back a JSON array of tags from stdout.
 
-interface Tag {
-  rel_fname: string
-  fname: string
-  line: number // 0-based start line of the definition
-  endLine: number // 0-based end line of the definition (== line for one-liners)
-  name: string
-  kind: "def" | "ref"
-  decl: string // first source line of the definition (signature), truncated
-}
+// `Tag` (the extract.mjs output shape) + `Graph`/`GraphEdge`/`RankedTag`/
+// `BuildInput` live in ./graph.ts. impl.ts re-exports them at the bottom for
+// the test harness; callers here use the local aliases imported above.
 
 const EXTRACT_SCRIPT_NAME = "extract.mjs"
 const EXTRACT_SCRIPT_INSTALLED_NAME = "ast-grep-map-extract.mjs"
@@ -218,192 +265,29 @@ async function extractAllTags(worktree: string, files: string[], signal: AbortSi
 // ---------------------------------------------------------------------------
 // Graph (aider MultiDiGraph: nodes=files, edges=referencer->definer per ident)
 // ---------------------------------------------------------------------------
+//
+// Graph construction, PageRank, and rank distribution live in ./graph.ts.
+// Local thin wrappers preserve the historical call sites while keeping the
+// pure math out of this I/O-heavy module.
 
-interface GraphEdge { src: string; dst: string; weight: number; ident: string }
-interface Graph {
-  nodes: string[]
-  edges: GraphEdge[]
-  outWeight: Map<string, number>
-}
-
-function isMeaningfulName(s: string): boolean {
-  const isSnake = s.includes("_") && /[a-z]/i.test(s)
-  const isKebab = s.includes("-") && /[a-z]/i.test(s)
-  const isCamel = /[a-z]/.test(s) && /[A-Z]/.test(s)
-  return (isSnake || isKebab || isCamel) && s.length >= 8
-}
-
-interface BuildInput {
-  defines: Map<string, Set<string>> // ident -> set of rel fnames that define it
-  references: Map<string, string[]> // ident -> list of rel fnames that reference it
-  mentionedIdents: Set<string>
-  chatFiles: Set<string>
-  allFiles: string[]
-}
+type Graph = GraphT
+type GraphEdge = GraphEdgeT
+type RankedTag = RankedTagT
 
 function buildGraph(input: BuildInput): Graph {
-  const { defines, references, mentionedIdents, chatFiles, allFiles } = input
-  const edges: GraphEdge[] = []
-  const outWeight = new Map<string, number>()
-  const add = (src: string, dst: string, weight: number, ident: string) => {
-    edges.push({ src, dst, weight, ident })
-    outWeight.set(src, (outWeight.get(src) ?? 0) + weight)
-  }
-
-  // If repo has no references at all, substitute defines as references
-  // (aider: `if not references: references = defines`).
-  let refs = references
-  if (references.size === 0) refs = new Map(Array.from(defines.entries()).map(([k, v]) => [k, Array.from(v)]))
-
-  for (const [ident, definers] of defines) {
-    if (definers.size === 0) continue
-    let mul = 1.0
-    if (mentionedIdents.has(ident)) mul *= 10
-    if (isMeaningfulName(ident)) mul *= 10
-    if (ident.startsWith("_")) mul *= 0.1
-    if (definers.size > 5) mul *= 0.1
-
-    const refList = refs.get(ident) ?? []
-    if (refList.length === 0) {
-      // definer with no references -> self-edge weight 0.1 (keeps isolated nodes ranked)
-      for (const d of definers) add(d, d, 0.1, ident)
-      continue
-    }
-    // Counter(references[ident]) -> num_refs per referencer
-    const counts = new Map<string, number>()
-    for (const r of refList) counts.set(r, (counts.get(r) ?? 0) + 1)
-    for (const [referencer, numRefs] of counts) {
-      const baseW = mul * Math.sqrt(numRefs)
-      for (const definer of definers) {
-        let w = baseW
-        if (chatFiles.has(referencer)) w *= 50 // chat-file boost (aider edge-level)
-        add(referencer, definer, w, ident)
-      }
-    }
-  }
-
-  return { nodes: allFiles.slice(), edges, outWeight }
+  return buildGraphImpl(input)
 }
-
-// ---------------------------------------------------------------------------
-// PageRank (networkx power-iteration semantics on a weighted multigraph)
-// ---------------------------------------------------------------------------
-// Update per node nbr:
-//   x[nbr] = (1-a)*p[nbr] + danglesum*p[nbr] + a * Σ_{n: n->nbr} xlast[n]*w(n,nbr)/outW[n]
-// where danglesum = a * Σ_{dangling n} xlast[n], convergence when L1 < N*tol.
-// (Reference: networkx/algorithms/link_analysis/pagerank_alg.py `pagerank`.)
 
 function pageRank(
   graph: Graph,
   personalization: Map<string, number>,
   opts: { alpha: number; max_iter: number; tol: number },
 ): Map<string, number> {
-  const { alpha, max_iter, tol } = opts
-  const nodes = graph.nodes
-  const N = nodes.length
-  if (N === 0) return new Map()
-
-  // Aggregate parallel edges: src -> (dst -> summed weight).
-  const adj = new Map<string, Map<string, number>>()
-  for (const e of graph.edges) {
-    let inner = adj.get(e.src)
-    if (!inner) {
-      inner = new Map<string, number>()
-      adj.set(e.src, inner)
-    }
-    inner.set(e.dst, (inner.get(e.dst) ?? 0) + e.weight)
-  }
-  const outW = graph.outWeight
-  const dangling = nodes.filter((n) => !outW.has(n) || (outW.get(n) ?? 0) === 0)
-
-  // Normalize personalization to sum 1 (networkx does this); uniform fallback.
-  let pSum = 0
-  for (const v of personalization.values()) pSum += v
-  const p = new Map<string, number>()
-  if (pSum > 0) {
-    for (const [k, v] of personalization) p.set(k, v / pSum)
-  } else {
-    for (const n of nodes) p.set(n, 1 / N)
-  }
-  // Fill missing nodes with uniform share of remaining mass (best effort).
-  for (const n of nodes) if (!p.has(n)) p.set(n, 0)
-
-  let x = new Map<string, number>()
-  for (const n of nodes) x.set(n, 1 / N)
-
-  for (let iter = 0; iter < max_iter; iter++) {
-    const xlast = x
-    x = new Map<string, number>()
-    for (const n of nodes) x.set(n, 0)
-
-    let danglesum = 0
-    for (const d of dangling) danglesum += xlast.get(d) ?? 0
-    danglesum *= alpha
-
-    for (const n of nodes) {
-      const xn = xlast.get(n) ?? 0
-      const out = adj.get(n)
-      if (out) {
-        const wsum = outW.get(n) ?? 0
-        if (wsum > 0) {
-          for (const [nbr, w] of out) {
-            x.set(nbr, (x.get(nbr) ?? 0) + alpha * xn * (w / wsum))
-          }
-        }
-      }
-      const teleport = (1 - alpha) * (p.get(n) ?? 0) + danglesum * (p.get(n) ?? 0)
-      x.set(n, (x.get(n) ?? 0) + teleport)
-    }
-
-    let err = 0
-    for (const n of nodes) err += Math.abs((x.get(n) ?? 0) - (xlast.get(n) ?? 0))
-    if (err < N * tol) break
-  }
-  return x
+  return pageRankImpl(graph, personalization, opts)
 }
 
-// ---------------------------------------------------------------------------
-// Rank distribution: file PageRank -> (file, ident) buckets -> def tags
-// ---------------------------------------------------------------------------
-
-interface RankedTag { tag: Tag; rank: number }
-
 function rankDefinitions(graph: Graph, scores: Map<string, number>, defTags: Tag[]): RankedTag[] {
-  const rankedDefs = new Map<string, number>() // "dst\0ident" -> rank
-  for (const e of graph.edges) {
-    const srcRank = scores.get(e.src) ?? 0
-    const total = graph.outWeight.get(e.src) ?? 0
-    if (total <= 0) continue
-    const key = `${e.dst}\0${e.ident}`
-    rankedDefs.set(key, (rankedDefs.get(key) ?? 0) + (srcRank * e.weight) / total)
-  }
-
-  // Resolve (dst, ident) -> def tags; pick the entries sorted desc by rank.
-  // Build a lookup of (rel_fname, ident) -> def tags.
-  const byKey = new Map<string, Tag[]>()
-  for (const tag of defTags) {
-    const key = `${tag.rel_fname}\0${tag.name}`
-    let arr = byKey.get(key)
-    if (!arr) {
-      arr = []
-      byKey.set(key, arr)
-    }
-    arr.push(tag)
-  }
-
-  const entries = Array.from(rankedDefs.entries())
-    .map(([key, rank]) => {
-      const [dst, ident] = key.split("\u0000")
-      return { dst, ident, rank }
-    })
-    .sort((a, b) => b.rank - a.rank || (a.dst < b.dst ? -1 : 1))
-
-  const out: RankedTag[] = []
-  for (const e of entries) {
-    const tags = byKey.get(`${e.dst}\0${e.ident}`)
-    if (tags) for (const t of tags) out.push({ tag: t, rank: e.rank })
-  }
-  return out
+  return rankDefinitionsImpl(graph, scores, defTags)
 }
 
 // ---------------------------------------------------------------------------
@@ -518,12 +402,16 @@ function discoverCodeFiles(root: string, langFilter?: string): string[] {
     }
     for (const name of entries) {
       const full = join(dir, name)
-      let st: any
+      let st: ReturnType<typeof lstatSync>
       try {
-        st = statSync(full)
+        // Improvement #4: lstatSync (not statSync) so symlinks are detected,
+        // not followed. A symlinked directory could escape the worktree root
+        // and pull arbitrary files into the graph; we refuse to descend.
+        st = lstatSync(full)
       } catch {
         continue
       }
+      if (st.isSymbolicLink()) continue
       if (st.isDirectory()) {
         if (IGNORE_DIRS.has(name)) continue
         stack.push(full)
@@ -587,38 +475,19 @@ function globMatch(pattern: string, path: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Persistence
+// Persistence — delegated to ./graph-store.ts (versioned schema + atomic
+// writes + source-manifest validation). The historical `PersistedGraph`
+// shape was replaced by `PersistedCache` (v2) with a primary worktree graph
+// and scope-keyed PPR snapshot overlays.
 // ---------------------------------------------------------------------------
 
-function resolveMapDir(worktree: string): string {
-  const override = process.env[MAP_DIR_ENV]
-  if (override) return resolve(override)
-  const worktreeMapDir = resolve(join(worktree, ".ast-grep"))
-  if (canWriteDir(worktreeMapDir)) return worktreeMapDir
-  const cacheRoot = process.env.XDG_CACHE_HOME || join(homedir(), ".cache")
-  const key = createHash("sha256").update(resolve(worktree)).digest("hex").slice(0, 16)
-  return resolve(join(cacheRoot, "opencode", "ast-grep-map", key))
-}
-
-function canWriteDir(dir: string): boolean {
-  const probe = join(dir, `.write-test-${process.pid}-${Date.now()}`)
-  try {
-    mkdirSync(dir, { recursive: true })
-    writeFileSync(probe, "")
-    rmSync(probe, { force: true })
-    return true
-  } catch {
-    return false
-  }
-}
-
+// `PersistedGraph` is retained as a local compatibility view over the v2
+// `worktreeGraph` payload so the REPORT.md generator + report tests don't
+// need to migrate in the same phase. New code should consume PersistedCache.
 interface PersistedGraph {
   version: number
   worktree: string
   generatedAt: string
-  damping: number
-  maxIter: number
-  tol: number
   nodeCount: number
   edgeCount: number
   nodes: string[]
@@ -626,61 +495,158 @@ interface PersistedGraph {
   scores: Record<string, number>
   rankedSymbols: Array<{ file: string; ident: string; rank: number; line: number; endLine: number; decl: string }>
   mentionedIdents: string[]
-  sourceMtimes: Record<string, number>
+  sourceManifest: SourceManifestEntry[]
 }
 
-function persistGraph(
+function cacheToGraphView(cache: PersistedCache): PersistedGraph {
+  const g = cache.worktreeGraph
+  return {
+    version: cache.version,
+    worktree: cache.worktree,
+    generatedAt: g.builtAt,
+    nodeCount: g.graph.nodes.length,
+    edgeCount: g.graph.edges.length,
+    nodes: g.graph.nodes,
+    edges: g.graph.edges,
+    scores: g.scores,
+    rankedSymbols: g.rankedSymbols,
+    mentionedIdents: g.mentionedIdents,
+    sourceManifest: g.sourceManifest,
+  }
+}
+
+function persistGraphAsCache(
+  worktree: string,
   graph: Graph,
   scores: Map<string, number>,
   ranked: RankedTag[],
-  mapDir: string,
-  meta: { worktree: string; mentionedIdents: string[]; sourceMtimes: Record<string, number> },
-): string {
-  try {
-    mkdirSync(mapDir, { recursive: true })
-  } catch {
-    /* ignore */
-  }
-  const outFile = join(mapDir, GRAPH_FILE)
-  const tmp = outFile + ".tmp"
-  const payload: PersistedGraph = {
-    version: 1,
-    worktree: meta.worktree,
-    generatedAt: new Date().toISOString(),
-    damping: DAMPING,
-    maxIter: MAX_ITER,
-    tol: TOL,
-    nodeCount: graph.nodes.length,
-    edgeCount: graph.edges.length,
-    nodes: graph.nodes,
-    edges: graph.edges,
-    scores: Object.fromEntries(scores),
-    rankedSymbols: ranked.map((r) => ({ file: r.tag.rel_fname, ident: r.tag.name, rank: r.rank, line: r.tag.line, endLine: r.tag.endLine ?? r.tag.line, decl: r.tag.decl || r.tag.name })),
-    mentionedIdents: meta.mentionedIdents,
-    sourceMtimes: meta.sourceMtimes,
-  }
-  writeFileSync(tmp, JSON.stringify(payload))
-  try {
-    renameSync(tmp, outFile)
-  } catch {
-    // rename can fail across devices; fall back to direct write.
-    writeFileSync(outFile, JSON.stringify(payload))
-  }
-  return outFile
-}
-
-function loadPersisted(mapDir: string): PersistedGraph | null {
-  try {
-    const raw = readFileSync(join(mapDir, GRAPH_FILE), "utf8")
-    return JSON.parse(raw) as PersistedGraph
-  } catch {
-    return null
-  }
+  sourceManifest: SourceManifestEntry[],
+  mentionedIdents: string[],
+): PersistedCache {
+  const cache = buildInitialCache(
+    worktree,
+    { nodes: graph.nodes, edges: graph.edges },
+    scores,
+    ranked,
+    sourceManifest,
+    mentionedIdents,
+  )
+  writePersistedGraphCache(worktree, cache)
+  // Keep the in-memory lifecycle state in sync so scope snapshots layered on
+  // top (Phase 4) reference the freshly built worktree graph.
+  setWorktreeGraphCache(worktree, cache)
+  return cache
 }
 
 // ---------------------------------------------------------------------------
 // The tool
 // ---------------------------------------------------------------------------
+
+// Apply PPR bias to a baseline ranking, persisting a scope-keyed snapshot for
+// reuse on subsequent calls with the same scope+seeds. Returns the baseline
+// unchanged when no scope is given (preserves unscoped byte-identical output).
+//
+// Critical ordering: the caller MUST have already populated the worktree graph
+// cache (via setWorktreeGraphCache / persistGraphAsCache) before invoking this,
+// because persistScopedRankSnapshot writes into the in-memory cache payload.
+async function applyScopedRanking(
+  worktree: string,
+  graph: Graph,
+  defTags: Tag[],
+  baseline: RankedTag[],
+  args: { paths?: string[]; globs?: string[]; mentioned_idents?: string[] },
+): Promise<RankedTag[]> {
+  const scopeGiven =
+    !!(args.paths && args.paths.length) ||
+    !!(args.globs && args.globs.length) ||
+    !!(args.mentioned_idents && args.mentioned_idents.length)
+  if (!scopeGiven) return baseline
+
+  const { seeds, scope } = buildScopeSeeds(worktree, graph.nodes, args)
+  let snapshot = await getScopedRankSnapshot(worktree, scope, seeds)
+  let fileScores: Record<string, number> | null = snapshot?.rankSnapshot.fileScores ?? null
+
+  if (!snapshot) {
+    // Derive locally first so we ALWAYS have scores to apply, even if the
+    // persist step below cannot write (e.g., cache still null in a race).
+    const derived = deriveScopedFileScores(graph, seeds, {
+      damping: DAMPING,
+      maxIterations: MAX_ITER,
+      tolerance: TOL,
+    })
+    fileScores = derived.fileScores
+    // Persist happens after the caller installs the worktree cache; here we
+    // only attempt it best-effort (it will succeed on the cache-hit path where
+    // the worktree cache is already in memory).
+    snapshot = await persistScopedRankSnapshot(worktree, scope, seeds, derived)
+    fileScores = snapshot?.rankSnapshot.fileScores ?? derived.fileScores
+  }
+
+  return applyScopeScores(graph, defTags, baseline, fileScores)
+}
+
+// Resolve the worktree graph from cache OR rebuild it from scratch.
+// Returns the in-memory graph, the def tags, and a uniform-personalization
+// ranked list (used for the worktree cache + REPORT.md + as the baseline for
+// scope-aware re-ranking).
+async function resolveWorktreeGraph(
+  worktree: string,
+  allFiles: string[],
+  scopeFiles: Set<string>,
+  mentionedIdents: Set<string>,
+  signal: AbortSignal,
+): Promise<{ graph: Graph; defTags: Tag[]; ranked: RankedTag[]; scores: Map<string, number> } | { error: string }> {
+  const relFiles = allFiles.map((f) => relative(worktree, f))
+  // No source manifest capture here — caller does that for cache keying.
+  const defTags: Tag[] = []
+  const defines = new Map<string, Set<string>>()
+  const references = new Map<string, string[]>()
+  let allTags: Tag[]
+  try {
+    allTags = await extractAllTags(worktree, allFiles, signal)
+  } catch (e: any) {
+    return { error: `ast-grep-map extraction failed: ${e.message || e}` }
+  }
+  const graphFiles = new Set<string>()
+  for (const t of allTags) {
+    graphFiles.add(t.rel_fname)
+    if (t.kind === "def") {
+      defTags.push(t)
+      let s = defines.get(t.name)
+      if (!s) {
+        s = new Set()
+        defines.set(t.name, s)
+      }
+      s.add(t.rel_fname)
+    } else {
+      let arr = references.get(t.name)
+      if (!arr) {
+        arr = []
+        references.set(t.name, arr)
+      }
+      arr.push(t.rel_fname)
+    }
+  }
+
+  const chatFiles = new Set(Array.from(scopeFiles).map((f) => relative(worktree, f)))
+  const graph = buildGraph({ defines, references, mentionedIdents, chatFiles, allFiles: Array.from(graphFiles) })
+
+  const personalization = new Map<string, number>()
+  const base = 100 / Math.max(graph.nodes.length, 1)
+  for (const n of graph.nodes) personalization.set(n, base)
+  for (const c of chatFiles) if (personalization.has(c)) personalization.set(c, (personalization.get(c) ?? 0) + base)
+  for (const ident of mentionedIdents) {
+    for (const n of graph.nodes) {
+      if (n.split(sep).includes(ident) || n.toLowerCase().includes(ident.toLowerCase())) {
+        personalization.set(n, (personalization.get(n) ?? 0) + base)
+      }
+    }
+  }
+
+  const scores = pageRank(graph, personalization, { alpha: DAMPING, max_iter: MAX_ITER, tol: TOL })
+  const ranked = rankDefinitions(graph, scores, defTags)
+  return { graph, defTags, ranked, scores }
+}
 
 function usableRoot(root: string | undefined): string | null {
   if (!root || root === "/" || root === "\\" || root === sep) return null
@@ -690,6 +656,98 @@ function usableRoot(root: string | undefined): string | null {
 function isSameOrInside(child: string, parent: string): boolean {
   const rel = relative(parent, child)
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))
+}
+
+// ---------------------------------------------------------------------------
+// Seed construction for Personalized PageRank (improvement #3)
+// ---------------------------------------------------------------------------
+//
+// Build a SeedEntry[] for a given scope. Seeds are workspace-relative POSIX
+// paths that the PPR personalization vector will be biased toward. Aider does
+// the same thing when you scope `paths`/`globs`: those files become the
+// personalization focus. Falls back to uniform personalization when no seeds.
+
+const SEED_PATHS_ENV_KEY = "OP_AST_GREP_MAP_SEED_PATHS"
+
+function buildScopeSeeds(
+  worktree: string,
+  graphNodes: string[],
+  args: { paths?: string[]; globs?: string[]; mentioned_idents?: string[] },
+): { seeds: SeedEntry[]; scope: EffectiveScope } {
+  // Compute the effective scope (POSIX-normalized paths/globs).
+  const paths = (args.paths ?? []).map((p) => normalizeRelativePath(relative(worktree, resolve(worktree, p))))
+  const globs = args.globs ?? []
+  const scope = normalizeEffectiveScope({ paths, globs })
+
+  const nodeSet = new Set(graphNodes)
+  const pushIfNode = (file: string, weight: number, source: string) => {
+    if (nodeSet.has(file)) seeds.push({ file, weight, source })
+  }
+
+  const seeds: SeedEntry[] = []
+
+  // paths → files inside any of the given paths become seeds
+  for (const node of graphNodes) {
+    if (isFileInScope(node, scope) && matchesScopeGlobs(node, scope)) {
+      pushIfNode(node, 1, "scope-path")
+    }
+  }
+
+  // mentioned_idents → files whose path components include the ident become seeds
+  for (const ident of args.mentioned_idents ?? []) {
+    const lower = ident.toLowerCase()
+    for (const node of graphNodes) {
+      const parts = node.split("/")
+      if (parts.includes(ident) || node.toLowerCase().includes(lower)) {
+        pushIfNode(node, 1, "mentioned-ident")
+      }
+    }
+  }
+
+  // AST_GREP_MAP_SEED_PATHS env var (debug seeds — port from other repo)
+  const envRaw = process.env[SEED_PATHS_ENV_KEY]?.trim()
+  if (envRaw) {
+    for (const candidate of envRaw.split(/[;,\r\n]+/).map((s) => s.trim()).filter(Boolean)) {
+      try {
+        const rel = normalizeRelativePath(relative(worktree, resolve(worktree, candidate)))
+        pushIfNode(rel, 1, "debug-seed-path")
+      } catch {
+        /* ignore bad paths */
+      }
+    }
+  }
+
+  // Normalize (dedupe, scope/glob-filter, symlink-reject — Phase 5 adds the
+  // symlink check; here we just thread workspaceRoot so the helper can use it).
+  const normalized = normalizeSeedEntries(seeds, scope, worktree)
+  return { seeds: normalized, scope }
+}
+
+// Re-rank def tags using a scope-derived PageRank score map. Falls back to the
+// passed-in `ranked` if no scope snapshot is available.
+function applyScopeScores(
+  graph: Graph,
+  defTags: Tag[],
+  ranked: RankedTag[],
+  scopeScores: Record<string, number> | null,
+): RankedTag[] {
+  if (!scopeScores) return ranked
+  const scoreMap = new Map<string, number>()
+  for (const [k, v] of Object.entries(scopeScores)) scoreMap.set(k, v)
+  // Only re-rank when the scope scores actually cover graph nodes; otherwise
+  // rankDefinitions would produce an empty output.
+  const covers = graph.nodes.some((n) => scoreMap.has(n))
+  if (!covers) return ranked
+  return rankDefinitions(graph, scoreMap, defTags)
+}
+
+// Rebuild the outWeight index from an edge list. Used by the cache-hit branch
+// where we reconstruct a Graph view from persisted data without going through
+// buildGraph (which would re-compute it from scratch on a different shape).
+function computeOutWeight(edges: GraphEdge[]): Map<string, number> {
+  const out = new Map<string, number>()
+  for (const e of edges) out.set(e.src, (out.get(e.src) ?? 0) + e.weight)
+  return out
 }
 
 function resolveRoot(ctx: Pick<ToolContext, "directory" | "worktree">, langFilter?: string): string {
@@ -729,7 +787,6 @@ const ast_grep_map = tool({
   execute: async (args, ctx) => {
     const worktree = resolveRoot(ctx, args.lang)
     const refresh = args.refresh ?? "auto"
-    const mapDir = resolveMapDir(worktree)
 
     // 1. Discover all code files (graph set).
     const allFiles = discoverCodeFiles(worktree, args.lang)
@@ -740,97 +797,76 @@ const ast_grep_map = tool({
     // 2. Scope (output map target / personalization focus).
     const scopeFiles = matchScope(allFiles, worktree, args.paths, args.globs)
     const mentionedIdents = new Set(args.mentioned_idents ?? [])
+    const scopeGiven =
+      !!(args.paths && args.paths.length) ||
+      !!(args.globs && args.globs.length) ||
+      !!(args.mentioned_idents && args.mentioned_idents.length)
 
-    // 3. mtime snapshot for cache validity + persistence.
-    const sourceMtimes: Record<string, number> = {}
-    for (const f of allFiles) {
-      try {
-        sourceMtimes[relative(worktree, f)] = statSync(f).mtimeMs
-      } catch {
-        /* ignore */
-      }
-    }
+    // 3. Capture source manifest (mtime+size) for cache validity.
+    const relFiles = allFiles.map((f) => relative(worktree, f))
+    const sourceManifest = captureSourceManifest(worktree, relFiles) ?? []
 
-    // 4. Try refresh:"auto" — reuse persisted ranked symbols if nothing changed.
-    const persisted = loadPersisted(mapDir)
-    if (
+    // 4. Hydrate lifecycle state once per process.
+    await initializeGraphPlugin(worktree)
+
+    // 5. Try refresh:"auto" — reuse persisted worktree graph if manifest unchanged.
+    const persisted = getWorktreeGraphCache(worktree)
+    const cacheHit =
       refresh === "auto" &&
-      persisted &&
-      persisted.sourceMtimes &&
-      Object.keys(persisted.sourceMtimes).length === Object.keys(sourceMtimes).length &&
-      Object.entries(sourceMtimes).every(([k, v]) => persisted.sourceMtimes[k] === v)
-    ) {
-      const maxTokens = (args.max_tokens ?? DEFAULT_MAX_TOKENS) * (scopeFiles.size === 0 || (args.paths && args.paths.length) ? 1 : MAP_MUL_NO_FILES)
-      const ranked: RankedTag[] = persisted.rankedSymbols.map((r) => ({
-        tag: { rel_fname: r.file, fname: r.file, line: r.line, endLine: r.endLine ?? r.line, name: r.ident, kind: "def", decl: r.decl || r.ident },
+      !!persisted &&
+      manifestsEqual(persisted.worktreeGraph.sourceManifest, sourceManifest)
+
+    if (cacheHit && persisted) {
+      // Reuse the cached worktree graph. The PPR scope overlay is layered on
+      // top — when scope is given, look up (or derive+persist) the scope
+      // snapshot and re-rank. Without this, scoped cache-hit calls would
+      // silently return uniform-personalization output.
+      const rankedUniform: RankedTag[] = persisted.worktreeGraph.rankedSymbols.map((r) => ({
+        tag: rankedSymbolToTag(r),
         rank: r.rank,
       }))
+      // Reconstruct a minimal Graph object sufficient for applyScopeScores
+      // (which only needs .nodes and .edges + .outWeight). The cache stores
+      // them; outWeight is recomputed from edges cheaply.
+      const cachedGraph: Graph = {
+        nodes: persisted.worktreeGraph.graph.nodes,
+        edges: persisted.worktreeGraph.graph.edges,
+        outWeight: computeOutWeight(persisted.worktreeGraph.graph.edges),
+      }
+      const ranked = await applyScopedRanking(worktree, cachedGraph, [], rankedUniform, args)
+      const maxTokens = (args.max_tokens ?? DEFAULT_MAX_TOKENS) * (scopeGiven ? 1 : MAP_MUL_NO_FILES)
+      if (args.json) return JSON.stringify(cacheToGraphView(persisted), null, 2)
       const tree = binarySearchTokenBudget(ranked, maxTokens)
-      if (args.json) return JSON.stringify(persisted, null, 2)
       return formatResult(tree)
     }
 
-    // 5. Extract tags for every file via the node subprocess (one spawn).
-    const defTags: Tag[] = []
-    const defines = new Map<string, Set<string>>()
-    const references = new Map<string, string[]>()
-    let allTags: Tag[]
-    try {
-      allTags = await extractAllTags(worktree, allFiles, ctx.abort)
-    } catch (e: any) {
-      return `ast-grep-map extraction failed: ${e.message || e}`
-    }
-    const graphFiles = new Set<string>()
-    for (const t of allTags) {
-      graphFiles.add(t.rel_fname)
-      if (t.kind === "def") {
-        defTags.push(t)
-        let s = defines.get(t.name)
-        if (!s) {
-          s = new Set()
-          defines.set(t.name, s)
-        }
-        s.add(t.rel_fname)
-      } else {
-        let arr = references.get(t.name)
-        if (!arr) {
-          arr = []
-          references.set(t.name, arr)
-        }
-        arr.push(t.rel_fname)
-      }
-    }
+    // 6. Cache miss — extract tags and rebuild the worktree graph.
+    const resolved = await resolveWorktreeGraph(worktree, allFiles, scopeFiles, mentionedIdents, ctx.abort)
+    if ("error" in resolved) return resolved.error
+    const { graph, defTags, ranked: rankedUniform, scores } = resolved
 
-    // 6. Build graph + personalization.
-    const chatFiles = new Set(Array.from(scopeFiles).map((f) => relative(worktree, f)))
-    const graph = buildGraph({ defines, references, mentionedIdents, chatFiles, allFiles: Array.from(graphFiles) })
-
-    const personalization = new Map<string, number>()
-    const base = 100 / Math.max(graph.nodes.length, 1)
-    for (const n of graph.nodes) personalization.set(n, base)
-    for (const c of chatFiles) if (personalization.has(c)) personalization.set(c, (personalization.get(c) ?? 0) + base)
-    for (const ident of mentionedIdents) {
-      // path-component match heuristic: files whose path components include the ident
-      for (const n of graph.nodes) {
-        if (n.split(sep).includes(ident) || n.toLowerCase().includes(ident.toLowerCase())) {
-          personalization.set(n, (personalization.get(n) ?? 0) + base)
-        }
-      }
-    }
-
-    // 7. PageRank + rank distribution.
-    const scores = pageRank(graph, personalization, { alpha: DAMPING, max_iter: MAX_ITER, tol: TOL })
-    const ranked = rankDefinitions(graph, scores, defTags)
-
-    // 8. Persist.
-    const outFile = persistGraph(graph, scores, ranked, mapDir, { worktree, mentionedIdents: Array.from(mentionedIdents), sourceMtimes })
+    // 7. Persist worktree graph FIRST so scope snapshots layered on top survive.
+    //    This was the root cause of three critical bugs in the first review:
+    //    persistGraphAsCache replaces state.cache with a fresh payload (scopes: []),
+    //    so any scope snapshot written before this step gets clobbered.
+    const cache = persistGraphAsCache(
+      worktree,
+      graph,
+      scores,
+      rankedUniform,
+      sourceManifest,
+      Array.from(mentionedIdents),
+    )
     if (args.json) {
-      const fresh = loadPersisted(mapDir)
-      return fresh ? JSON.stringify(fresh, null, 2) : `(failed to read back ${outFile})`
+      return JSON.stringify(cacheToGraphView(cache), null, 2)
     }
+
+    // 8. Now layer the scope-aware PPR ranking on top of the freshly persisted
+    //    worktree graph. persistScopedRankSnapshot writes into the same cache
+    //    payload installed in step 7, so the snapshot survives.
+    const ranked = await applyScopedRanking(worktree, graph, defTags, rankedUniform, args)
 
     // 9. Render to token budget.
-    const scopeGiven = !!(args.paths && args.paths.length) || !!(args.globs && args.globs.length)
     const maxTokens = (args.max_tokens ?? DEFAULT_MAX_TOKENS) * (scopeGiven ? 1 : MAP_MUL_NO_FILES)
     const tree = binarySearchTokenBudget(ranked, maxTokens)
     return formatResult(tree)
@@ -1273,40 +1309,18 @@ function writeReportAtomic(mapDir: string, markdown: string): string {
   return outPath
 }
 
-function currentSourceMtimes(worktree: string): Record<string, number> {
-  const out: Record<string, number> = {}
-  const files = discoverCodeFiles(worktree)
-  for (const f of files) {
-    try {
-      out[relative(worktree, f)] = statSync(f).mtimeMs
-    } catch {
-      /* ignore */
-    }
-  }
-  return out
-}
-
-function mtimesUnchanged(persisted: PersistedGraph | null, current: Record<string, number>): boolean {
-  if (!persisted || !persisted.sourceMtimes) return false
-  const p = persisted.sourceMtimes
-  if (Object.keys(p).length !== Object.keys(current).length) return false
-  for (const k of Object.keys(current)) if (p[k] !== current[k]) return false
-  return true
+function currentSourceManifest(worktree: string): SourceManifestEntry[] {
+  const files = discoverCodeFiles(worktree).map((f) => relative(worktree, f))
+  return captureSourceManifest(worktree, files) ?? []
 }
 
 // Mirrors the ast_grep_map tool's execute path with no scope focus: whole-repo
-// graph, uniform personalization, default ranking.
+// graph, uniform personalization, default ranking. Persists via graph-store.
 async function rebuildGraphForReport(worktree: string, signal: AbortSignal): Promise<PersistedGraph> {
   const allFiles = discoverCodeFiles(worktree)
   if (allFiles.length === 0) throw new Error(`no supported code files under ${worktree}`)
-  const sourceMtimes: Record<string, number> = {}
-  for (const f of allFiles) {
-    try {
-      sourceMtimes[relative(worktree, f)] = statSync(f).mtimeMs
-    } catch {
-      /* ignore */
-    }
-  }
+  const sourceManifest = captureSourceManifest(worktree, allFiles.map((f) => relative(worktree, f)))
+  if (!sourceManifest) throw new Error("failed to capture source manifest during report rebuild")
   const allTags: Tag[] = await extractAllTags(worktree, allFiles, signal)
   const defines = new Map<string, Set<string>>()
   const references = new Map<string, string[]>()
@@ -1343,15 +1357,8 @@ async function rebuildGraphForReport(worktree: string, signal: AbortSignal): Pro
   for (const n of graph.nodes) personalization.set(n, base)
   const scores = pageRank(graph, personalization, { alpha: DAMPING, max_iter: MAX_ITER, tol: TOL })
   const ranked = rankDefinitions(graph, scores, defTags)
-  const mapDir = resolveMapDir(worktree)
-  persistGraph(graph, scores, ranked, mapDir, {
-    worktree,
-    mentionedIdents: [],
-    sourceMtimes,
-  })
-  const fresh = loadPersisted(mapDir)
-  if (!fresh) throw new Error("failed to read back persisted graph after rebuild")
-  return fresh
+  const cache = persistGraphAsCache(worktree, graph, scores, ranked, sourceManifest, [])
+  return cacheToGraphView(cache)
 }
 
 export async function maybeRefreshReport(
@@ -1369,23 +1376,26 @@ export async function maybeRefreshReport(
   }
   const signal = opts.signal ?? new AbortController().signal
   try {
-    const persisted = loadPersisted(mapDir)
-    const current = currentSourceMtimes(worktree)
-    const unchanged = mtimesUnchanged(persisted, current)
+    await initializeGraphPlugin(worktree)
+    const persistedCache = getWorktreeGraphCache(worktree)
+    const currentManifest = currentSourceManifest(worktree)
+    const unchanged =
+      !!persistedCache && manifestsEqual(persistedCache.worktreeGraph.sourceManifest, currentManifest)
     const reportExists = existsSync(join(mapDir, REPORT_FILE))
 
-    if (!opts.force && unchanged && reportExists && persisted) {
+    if (!opts.force && unchanged && reportExists && persistedCache) {
       return { status: "skipped", reportPath: join(mapDir, REPORT_FILE) }
     }
 
-    const graph = opts.force || !persisted || !unchanged
-      ? await rebuildGraphForReport(worktree, signal)
-      : persisted
+    const graph =
+      opts.force || !persistedCache || !unchanged
+        ? await rebuildGraphForReport(worktree, signal)
+        : cacheToGraphView(persistedCache)
 
     const markdown = generateReport(graph, { worktree })
     const reportPath = writeReportAtomic(mapDir, markdown)
     return {
-      status: persisted && reportExists ? "rebuilt" : "fresh",
+      status: persistedCache && reportExists ? "rebuilt" : "fresh",
       reportPath,
     }
   } catch (e: any) {
@@ -1400,19 +1410,63 @@ export async function maybeRefreshReport(
 export const tools = { ast_grep_map }
 
 const astGrepMapPlugin: Plugin = async (input) => {
+  const worktree = resolveRoot(input)
+  // Initialize the lifecycle state (lazy once-per-process hydration of the
+  // disk cache) so the very first ast_grep_map call does not pay the hydration
+  // cost and so scope-snapshot state is available to the invalidation hooks.
+  try {
+    await initializeGraphPlugin(worktree)
+  } catch {
+    /* hydration is best-effort; map calls fall back to a rebuild */
+  }
   return {
     tool: tools,
     event: async ({ event }) => {
-      if (event.type !== "session.created") return
-      // Fire-and-forget: do NOT await (session start must not block). Same
-      // pattern as ast-grep's sg-binary provisioning.
-      const worktree = resolveRoot(input)
-      const handle = setTimeout(() => {
-        maybeRefreshReport(worktree).catch(() => {
-          /* errors are logged inside maybeRefreshReport */
-        })
-      }, 0)
-      handle.unref()
+      if (event.type === "session.created") {
+        // Fire-and-forget: do NOT await (session start must not block). Same
+        // pattern as ast-grep's sg-binary provisioning.
+        const handle = setTimeout(() => {
+          maybeRefreshReport(worktree).catch(() => {
+            /* errors are logged inside maybeRefreshReport */
+          })
+        }, 0)
+        handle.unref()
+        return
+      }
+      // Improvement #1: file edits invalidate scope-keyed rank snapshots so the
+      // next ast_grep_map call rebuilds them. Worktree-graph freshness is
+      // manifest-driven, so this hook only needs to touch the scope overlays.
+      // The event shape is loose (opencode SDK Event typing is permissive) so
+      // we narrow defensively.
+      if (event.type === "file.edited" || event.type === "file.watcher.updated") {
+        const f = (event as { properties?: { file?: unknown } }).properties?.file
+        if (typeof f === "string") {
+          try {
+            await markStaleForPath(worktree, f)
+          } catch {
+            /* invalidation must never break the event loop */
+          }
+        }
+      }
+    },
+    "tool.execute.after": async (toolInput, toolOutput) => {
+      // Same invalidation trigger when the user edits/writes a file via opencode's
+      // own edit/write tools. The metadata shape varies across opencode versions,
+      // so we narrow defensively.
+      if (toolInput.tool !== "edit" && toolInput.tool !== "write") return
+      const meta = (toolOutput as { metadata?: Record<string, unknown> }).metadata ?? {}
+      const direct = typeof meta.filepath === "string" ? meta.filepath : null
+      const filediff = typeof meta.filediff === "object" && meta.filediff !== null
+        ? (meta.filediff as { file?: unknown }).file
+        : null
+      const f = direct ?? (typeof filediff === "string" ? filediff : null)
+      if (f) {
+        try {
+          await markStaleForPath(worktree, f)
+        } catch {
+          /* invalidation must never break the post-tool hook */
+        }
+      }
     },
   }
 }
@@ -1430,10 +1484,11 @@ export {
   discoverCodeFiles,
   languageForFile,
   resolveExtractScript,
-  resolveMapDir,
   resolveRoot,
-  loadPersisted,
-  persistGraph,
+  buildScopeSeeds,
+  applyScopedRanking,
+  applyScopeScores,
+  computeOutWeight,
   DAMPING,
   MAX_ITER,
   TOL,
