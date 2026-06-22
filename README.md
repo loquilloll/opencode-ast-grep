@@ -59,7 +59,7 @@ src/                         all TypeScript source
   ast-grep-map/extract.mjs   tree-sitter tag extractor (runs as a node subprocess)
   ast-grep-map/queries/      vendored aider -tags.scm query files
   skills/ast-grep/           the skill (SKILL.md + references + helper script)
-test/                        10 test suites (run with tsx)
+test/                        11 test suites (run with tsx)
 scripts/copy-assets.mjs      copies extract.mjs + queries into dist/ on build
 .opencode/plugins/ast-grep.ts   thin shim opencode scans; re-exports src/plugin
 .opencode/skills/ast-grep       symlink -> src/skills/ast-grep (opencode scans here)
@@ -97,7 +97,7 @@ Node 24's V8 requires C++20 but tree-sitter's `binding.gyp` ships pinned to C++1
 | Script | Purpose |
 |---|---|
 | `npm run typecheck` | `tsc --noEmit` over `src/` + `test/` + the `.opencode` shim. |
-| `npm test` | Runs all 10 test suites via `tsx` (hermetic; some need network for sg provisioning). |
+| `npm test` | Runs all 11 test suites via `tsx` (hermetic; some need network for sg provisioning). |
 | `npm run test:ast-grep` | Just the ast-grep smoke suite. |
 | `npm run test:ast-grep-truncation` | Just the byte-cap + JSON-repair suite. |
 | `npm run test:ast-grep-map` | Just the ast-grep-map smoke suite. |
@@ -134,7 +134,7 @@ See [`AGENTS.md`](./AGENTS.md) for the full list.
 ## Testing
 
 ```bash
-npm test          # all 10 suites (hermetic, except sg-binary provisioning on first run)
+npm test          # all 11 suites (hermetic, except sg-binary provisioning on first run)
 ```
 
 Tests run on `.ts` source via the `tsx` runner (no compile step). The default `npm test` runs ten suites:

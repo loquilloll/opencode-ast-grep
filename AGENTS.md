@@ -41,7 +41,7 @@ scripts/copy-assets.mjs    copies extract.mjs + queries into dist/ after tsc
 ```bash
 npm install --legacy-peer-deps   # --legacy-peer-deps required for tree-sitter grammars
 npm run typecheck                # tsc, no emit (covers src + test + shim)
-npm test                         # all 10 test suites (tsx runner; hermetic)
+npm test                         # all 11 test suites (tsx runner; hermetic)
 npm run build                    # tsc src -> dist + copy assets
 ```
 

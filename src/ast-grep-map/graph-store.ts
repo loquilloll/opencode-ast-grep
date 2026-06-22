@@ -14,6 +14,7 @@ import { createHash } from "node:crypto"
 import { homedir } from "node:os"
 import { join, resolve } from "node:path"
 import {
+  getScopeKey,
   isSafeRelativePath,
   normalizeRelativePath,
   normalizeEffectiveScope,
@@ -210,7 +211,12 @@ function normalizeEffectiveScopeInput(input: unknown): EffectiveScope | null {
   if (!input || typeof input !== "object") return null
   const s = input as Partial<EffectiveScope> & { paths?: unknown; globs?: unknown }
   if (!Array.isArray(s.paths) || !Array.isArray(s.globs)) return null
-  if (!s.paths.every((p) => typeof p === "string") || !s.globs.every((g) => typeof g === "string")) return null
+  if (
+    !s.paths.every((p) => typeof p === "string" && p.length > 0 && !p.includes("\0")) ||
+    !s.globs.every((g) => typeof g === "string" && g.length > 0 && !g.includes("\0"))
+  ) {
+    return null
+  }
   return normalizeEffectiveScope({ paths: s.paths, globs: s.globs })
 }
 
@@ -224,7 +230,13 @@ function normalizeWorktreeGraph(input: unknown): PersistedWorktreeGraph | null {
 
   const sourceManifest = g.sourceManifest.map(normalizeSourceManifestEntry).filter((x): x is SourceManifestEntry => x !== null)
   const rankedSymbols = g.rankedSymbols.map(normalizeRankedSymbol).filter((x): x is RankedSymbol => x !== null)
-  const mentionedIdents = g.mentionedIdents.filter((x): x is string => typeof x === "string")
+  // Reject mentionedIdents containing NUL — consistency with edge/rankedSymbol
+  // ident validation. No NUL-keyed sink consumes mentionedIdents today, but
+  // defense-in-depth: a future rankDefinitions-style separator would surface
+  // the gap as a real bug.
+  const mentionedIdents = g.mentionedIdents.filter(
+    (x): x is string => typeof x === "string" && !x.includes("\0"),
+  )
   const nodes = [...new Set(g.graph.nodes.map((n) => normalizeRelativePath(String(n))))].filter(isSafeRelativePath).sort()
   const nodeSet = new Set(nodes)
   const edges = g.graph.edges
@@ -255,6 +267,11 @@ function normalizeScopeSnapshot(input: unknown): PersistedScopeSnapshot | null {
   if (typeof s.scopeKey !== "string" || s.scopeKey === "") return null
   const effectiveScope = normalizeEffectiveScopeInput(s.effectiveScope)
   if (!effectiveScope) return null
+  // scopeKey must be the canonical JSON of the (normalized) effectiveScope.
+  // Without this check, a crafted cache could pair an attacker-chosen
+  // scopeKey with a different effectiveScope, confusing markStaleForPath's
+  // scope-matching lookup in graph-service.ts.
+  if (s.scopeKey !== getScopeKey(effectiveScope)) return null
   if (!s.rankSnapshot || typeof s.rankSnapshot !== "object") return null
   const rs = s.rankSnapshot as Partial<RankSnapshot>
   if (

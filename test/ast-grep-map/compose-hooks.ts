@@ -73,9 +73,12 @@ async function testErrorIsolation(): Promise<void> {
   }
 }
 
-// --- Test 4: every CHAINABLE key from the Hooks surface is composed ---
-async function testAllChainableKeysComposed(): Promise<void> {
-  console.log("[4] composeHooks covers every async-hook key on both inputs")
+// --- Test 4: representative async-hook keys are composed (not exhaustive ---
+// the composition mechanism at plugin.ts:52-79 is uniform — the same `for`
+// loop handles every key — so sampling 8 of the 17 CHAINABLE keys is enough
+// to pin the behavior. Add more if you change the dispatch mechanism itself.)
+async function testRepresentativeChainableKeysComposed(): Promise<void> {
+  console.log("[4] composeHooks covers representative async-hook keys on both inputs")
   const aCalls: string[] = []
   const bCalls: string[] = []
   const make = (label: string, sink: string[]): Hooks => ({
@@ -116,7 +119,7 @@ async function testAllChainableKeysComposed(): Promise<void> {
   await testBothPresent()
   await testAsymmetric()
   await testErrorIsolation()
-  await testAllChainableKeysComposed()
+  await testRepresentativeChainableKeysComposed()
   console.log(failures === 0 ? "\nALL TESTS PASSED" : `\n${failures} TEST(S) FAILED`)
   process.exit(failures === 0 ? 0 : 1)
 })().catch((e) => {

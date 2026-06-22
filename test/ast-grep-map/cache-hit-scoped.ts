@@ -7,6 +7,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "nod
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import { tools } from "../../src/ast-grep-map/impl.ts"
+import { initializeGraphPlugin, shutdownGraphPlugin } from "../../src/ast-grep-map/graph-service.ts"
 
 process.env.OP_AST_GREP_MAP_SCRIPT = resolve("src/ast-grep-map/extract.mjs")
 
@@ -42,6 +43,13 @@ async function withWorktree<T>(name: string, fn: (wt: string) => Promise<T>): Pr
     return await fn(wt)
   } finally {
     delete process.env.OP_AST_GREP_MAP_DIR
+    // Match the cleanup hygiene of ppr-wiring.ts / graph-lifecycle.ts so this
+    // suite doesn't leak entries in the module-level workspaceGraphStore Map.
+    try {
+      await shutdownGraphPlugin(wt)
+    } catch {
+      /* best-effort */
+    }
     rmSync(wt, { recursive: true, force: true })
   }
 }
@@ -68,22 +76,23 @@ function makeCtx(wt: string) {
     assert(!cold.includes("(no ranked symbols"), `cold call rendered symbols (got: ${cold.split("\n")[0]})`)
 
     console.log("[2] Warm call (cache hit) with paths=src/ — same scope, should reuse")
+    console.log("    (primary regression catcher for the defTags reconstruction bug: a warm")
+    console.log("    cache + PPR overlay would return '(no ranked symbols to display)' without it)")
     const warm: string = await tool.execute({ paths: ["src"], refresh: "auto" }, makeCtx(wt))
     assert(typeof warm === "string" && warm.length > 0, "warm call returned non-empty")
     assert(!warm.includes("(no ranked symbols"), `warm call rendered symbols (got: ${warm.split("\n")[0]})`)
     assert(warm === cold, "warm call output matches cold (same scope, no seed change)")
 
-    console.log("[3] Warm call with mentioned_idents — exercises PPR overlay on cache-hit branch")
+    console.log("[3] Warm call with mentioned_idents — additional coverage of the PPR")
+    console.log("    overlay seed-construction path (test [2] already catches the main bug)")
     const biased: string = await tool.execute(
       { paths: ["src"], mentioned_idents: ["helper"], refresh: "auto" },
       makeCtx(wt),
     )
     assert(typeof biased === "string" && biased.length > 0, "biased call returned non-empty")
-    // THIS is the regression assertion: defTags reconstruction means the
-    // cache-hit branch must NOT return "(no ranked symbols to display)".
     assert(
       !biased.includes("(no ranked symbols"),
-      `biased warm-cache call rendered symbols instead of empty (got: ${biased.split("\n")[0]})`,
+      `biased warm-cache call rendered symbols (got: ${biased.split("\n")[0]})`,
     )
 
     console.log("[4] Cache payload has a scope snapshot for src/")

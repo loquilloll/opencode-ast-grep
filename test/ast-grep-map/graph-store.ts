@@ -180,16 +180,16 @@ function testScopeRoundtrip(): void {
   assert(s?.seedEntries.length === 1 && s?.seedEntries[0]?.source === "scope-path", "seedEntries preserved")
   assert(s?.refreshState.stale === false, "refreshState.stale preserved")
 
-  // NUL-in-ident rejection: tamper with the cache, write, read back — verify rejected.
+  // Unsafe-path-key rejection in scope fileScores (separate from ident-NUL
+  // rejection — that's exercised by testNulIdentRejection below). The scopeKey
+  // MUST match getScopeKey(effectiveScope); the new validator enforces this.
+  const validScopeKey = JSON.stringify({ paths: [], globs: [] })
   const tampered = makeCache(worktree)
   tampered.scopes.push({
-    scopeKey: "evil",
+    scopeKey: validScopeKey,
     effectiveScope: { paths: [], globs: [] },
     seedEntries: [],
     rankSnapshot: {
-      // ident with NUL would collide in rankDefinitions; the edge validator
-      // rejects NUL but scores are validated separately. Confirm score with
-      // an unsafe key is dropped.
       fileScores: { "C:\\evil.ts": 0.5, "src/a.ts": 0.5 },
       scoreSource: "ppr",
       builtAt: "2026-06-22T00:00:00.000Z",
@@ -198,13 +198,94 @@ function testScopeRoundtrip(): void {
   })
   writePersistedGraphCache(worktree, tampered)
   const tamperedRead = readPersistedGraphCache(worktree)
-  const evil = tamperedRead?.scopes.find((x) => x.scopeKey === "evil")
-  assert(evil !== undefined, "evil scope survived (its scope shape is valid)")
+  const evil = tamperedRead?.scopes.find((x) => x.scopeKey === validScopeKey)
+  assert(evil !== undefined, "scope survived (valid scopeKey + safe shape)")
   assert(evil?.rankSnapshot.fileScores["C:\\evil.ts"] === undefined, "windows-drive key dropped from fileScores")
   assert(evil?.rankSnapshot.fileScores["src/a.ts"] === 0.5, "legitimate key preserved")
 
+  // Scope with mismatched scopeKey (attacker-chosen key + different effectiveScope)
+  // MUST be rejected by the new scopeKey consistency check.
+  const mismatched = makeCache(worktree)
+  mismatched.scopes.push({
+    scopeKey: "attacker-chosen-key",
+    effectiveScope: { paths: ["src"], globs: [] },
+    seedEntries: [],
+    rankSnapshot: {
+      fileScores: {},
+      scoreSource: "heuristic",
+      builtAt: "2026-06-22T00:00:00.000Z",
+    },
+    refreshState: { stale: false },
+  })
+  writePersistedGraphCache(worktree, mismatched)
+  const mismatchedRead = readPersistedGraphCache(worktree)
+  assert(
+    !mismatchedRead?.scopes.some((x) => x.scopeKey === "attacker-chosen-key"),
+    "mismatched scopeKey rejected (consistency check)",
+  )
+
   rmSync(worktree, { recursive: true, force: true })
   delete process.env.OP_AST_GREP_MAP_DIR
+}
+
+// --- Test 7: NUL-in-ident rejection (security regression test) ---
+// rankDefinitions (graph.ts:197) uses `\u0000` as the (dst, ident) separator
+// when bucketing definitions for ranking. A crafted cache that smuggles a NUL
+// byte into an edge.ident or rankedSymbol.ident could collide keys with a
+// legitimate entry and skew ranking. The validators at graph-store.ts:163
+// (normalizeFileEdge) and :194 (normalizeRankedSymbol) reject idents containing
+// NUL — this test pins that guard so a future refactor cannot silently drop it.
+function testNulIdentRejection(): void {
+  console.log("[7] NUL-in-ident rejection (edge + rankedSymbol)")
+  // Edge with NUL in ident → dropped
+  const evilEdge = validatePersistedCache({
+    version: 2,
+    updatedAt: "2026-06-22T00:00:00.000Z",
+    worktree: "/repo",
+    worktreeGraph: {
+      builtAt: "2026-06-22T00:00:00.000Z",
+      sourceManifest: [],
+      graph: {
+        nodes: ["src/a.ts", "src/b.ts"],
+        edges: [
+          { src: "src/a.ts", dst: "src/b.ts", weight: 1, ident: "evil\u0000src/b.ts" },
+          { src: "src/a.ts", dst: "src/b.ts", weight: 1, ident: "legit" },
+        ],
+      },
+      scores: {},
+      rankedSymbols: [],
+      mentionedIdents: [],
+    },
+    scopes: [],
+    nextEpoch: 0,
+  })
+  assert(evilEdge !== null, "cache payload accepted (only the bad edge is dropped)")
+  const dropped = evilEdge?.worktreeGraph.graph.edges.filter((e) => e.ident.includes("\0"))
+  assert((dropped ?? []).length === 0, "edge with NUL in ident dropped")
+  assert(evilEdge?.worktreeGraph.graph.edges.length === 1, "only the legit edge survived")
+
+  // rankedSymbol with NUL in ident → dropped
+  const evilRanked = validatePersistedCache({
+    version: 2,
+    updatedAt: "2026-06-22T00:00:00.000Z",
+    worktree: "/repo",
+    worktreeGraph: {
+      builtAt: "2026-06-22T00:00:00.000Z",
+      sourceManifest: [],
+      graph: { nodes: ["src/a.ts"], edges: [] },
+      scores: {},
+      rankedSymbols: [
+        { file: "src/a.ts", ident: "evil\u0000collision", rank: 0.5, line: 1, endLine: 1, decl: "x" },
+        { file: "src/a.ts", ident: "legit", rank: 0.5, line: 2, endLine: 2, decl: "y" },
+      ],
+      mentionedIdents: [],
+    },
+    scopes: [],
+    nextEpoch: 0,
+  })
+  assert(evilRanked !== null, "cache payload accepted (only the bad rankedSymbol is dropped)")
+  assert(evilRanked?.worktreeGraph.rankedSymbols.length === 1, "only the legit rankedSymbol survived")
+  assert(evilRanked?.worktreeGraph.rankedSymbols[0]?.ident === "legit", "legit rankedSymbol preserved")
 }
 
 // --- main ---
@@ -215,6 +296,7 @@ function testScopeRoundtrip(): void {
   testCaptureManifest()
   testStableSerialization()
   testScopeRoundtrip()
+  testNulIdentRejection()
   console.log(failures === 0 ? "\nALL TESTS PASSED" : `\n${failures} TEST(S) FAILED`)
   process.exit(failures === 0 ? 0 : 1)
 })()

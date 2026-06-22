@@ -11,7 +11,6 @@ import {
   getScopedRankSnapshot,
   getWorktreeGraphCache,
   persistScopedRankSnapshot,
-  setWorktreeGraphCache,
   shutdownGraphPlugin,
 } from "../../src/ast-grep-map/graph-service.ts"
 import {

@@ -20,6 +20,7 @@ import {
   markStaleForPath,
   getWorktreeGraphCache,
   persistScopedRankSnapshot,
+  setWorktreeGraphCache,
 } from "../../src/ast-grep-map/graph-service.ts"
 import {
   buildInitialCache,
@@ -214,6 +215,39 @@ async function testCacheHitCoherence(): Promise<void> {
   })
 }
 
+// --- Test 6: setWorktreeGraphCache AFTER persistScopedRankSnapshot clobbers
+//     scopes[] (inverse of test 1). This pins the ordering invariant: the
+//     impl.ts execute path must persist the worktree graph BEFORE the scope
+//     snapshot. Without this assertion, a refactor that swaps the order
+//     would silently lose scope snapshots and nothing in the unit suite
+//     would catch it (cache-hit-scoped.ts catches it at the integration
+//     layer, but that requires the extract.mjs subprocess).
+async function testScopeClobberedByInverseOrdering(): Promise<void> {
+  console.log("[6] setWorktreeGraphCache after persistScopedRankSnapshot clobbers scopes (ordering pin)")
+  await withWorktree("inverse", async (wt) => {
+    await initializeGraphPlugin(wt)
+    writePersistedGraphCache(wt, buildCacheFromGraph(wt))
+    await shutdownGraphPlugin(wt)
+    await initializeGraphPlugin(wt)
+
+    // Step A: write a scope snapshot into the live cache.
+    const scope = { paths: ["src"], globs: [] }
+    await persistScopedRankSnapshot(wt, scope, [], {
+      fileScores: { "src/hub.ts": 0.9 },
+      scoreSource: "ppr",
+    })
+    let before = getWorktreeGraphCache(wt)
+    assert(before?.scopes.length === 1, "scope present before setWorktreeGraphCache")
+
+    // Step B: simulate the WRONG ordering — install a fresh worktree cache
+    // (scopes: []) AFTER the scope was written. The fresh cache replaces the
+    // in-memory state, dropping the scope snapshot.
+    setWorktreeGraphCache(wt, buildCacheFromGraph(wt))
+    const after = getWorktreeGraphCache(wt)
+    assert(after?.scopes.length === 0, "setWorktreeGraphCache clobbers pre-existing scopes (this is WHY the impl.ts ordering matters)")
+  })
+}
+
 // --- main ---
 ;(async () => {
   await testScopePersistsAfterWorktreeInstall()
@@ -221,6 +255,7 @@ async function testCacheHitCoherence(): Promise<void> {
   await testMentionedIdentsSeeds()
   await testInvalidationClearsScope()
   await testCacheHitCoherence()
+  await testScopeClobberedByInverseOrdering()
   console.log(failures === 0 ? "\nALL TESTS PASSED" : `\n${failures} TEST(S) FAILED`)
   process.exit(failures === 0 ? 0 : 1)
 })().catch((e) => {
