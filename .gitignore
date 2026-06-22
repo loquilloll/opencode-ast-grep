@@ -9,6 +9,7 @@ dist/
 
 # opencode local working dir (plugin shim, runtime, node_modules, etc. — installed/generated, not tracked)
 .opencode/
+opencode.json
 
 # opencode session plans (ephemeral scratch)
 docs/plans/
