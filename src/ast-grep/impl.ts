@@ -1010,7 +1010,7 @@ const stringArg = (description: string) => tool.schema.string().describe(descrip
 
 const ast_grep_search = tool({
   description:
-    "Search code by ast-grep AST pattern. Returns matches as `file:line:col preview` plus a file-count summary. Use $VAR for a single node and $$$ to match many nodes (NOT regex).",
+    "Search code by ast-grep AST pattern. Returns matches as `file:line:col preview` plus a file-count summary. Use $VAR for a single node and $$$ to match many nodes (NOT regex). Output is byte-capped at 1 MB (child SIGTERM'd on cap; partial JSON salvaged via bracket-repair) and at 500 matches for JSON mode / 50 for human display.",
   args: {
     pattern: stringArg("ast-grep AST pattern, e.g. 'console.log($MSG)'. Use $VAR for one node, $$$ for many."),
     lang: tool.schema.string().optional().describe("Language alias (ts, js, py, go, rs, ...) or canonical name."),
@@ -1073,7 +1073,7 @@ const ast_grep_search = tool({
 
 const ast_grep_replace = tool({
   description:
-    "Rewrite code by ast-grep AST pattern. Dry-run by default (shows what would change); pass apply=true to mutate files. Two-pass: JSON preview then --update-all (sg silently ignores --update-all when --json is set).",
+    "Rewrite code by ast-grep AST pattern. Dry-run by default (shows what would change); pass apply=true to mutate files. Two-pass: JSON preview then --update-all (sg silently ignores --update-all when --json is set). Pass-1 output is byte-capped at 1 MB (child SIGTERM'd on cap; partial JSON salvaged) — when truncated, the apply step uses the recovered count which may be lower than the true total.",
   args: {
     pattern: stringArg("ast-grep AST pattern to match."),
     rewrite: stringArg("Replacement pattern; reuse $VAR captured in pattern."),

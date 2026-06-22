@@ -175,7 +175,7 @@ When using `sg` directly in a shell, **always single-quote patterns** so `$VAR` 
 
 ## ast_grep_map — repo map with PageRank
 
-A **native opencode tool** (no `sg` command, no helper subcommand). It produces an **aider-style repo map**: a compact outline of symbol declarations, each annotated with a GitHub-style line range (`L<n>` for one-liners, `L<start>-L<end>` for spans), ranked by **PageRank** so the most-referenced symbols surface first. The PageRank graph (files as nodes, reference→definition edges) is built from the whole worktree and **persisted to `<worktree>/.ast-grep/graph.json`**.
+A **native opencode tool** (no `sg` command, no helper subcommand). It produces an **aider-style repo map**: a compact outline of symbol declarations, each annotated with a GitHub-style line range (`L<n>` for one-liners, `L<start>-L<end>` for spans), ranked by **PageRank** so the most-referenced symbols surface first. The PageRank graph (files as nodes, reference→definition edges) is built from the whole worktree and **persisted to `<worktree>/.ast-grep/graph.json`** (schema v2: primary worktree graph + scope-keyed PPR snapshot overlays).
 
 On session startup the plugin also writes **`.ast-grep/REPORT.md`** — a markdown briefing derived from the same graph (god-node hubs, surprising cross-module edges, module dependency graph, orphaned defs, multi-definer ambiguity). Read it first when orienting in an unfamiliar repo. See [references/repo-briefing.md](references/repo-briefing.md) for what each section means and when to trust it.
 
@@ -197,32 +197,42 @@ Don't use it for: text search (use `rg`), a single structural match (use `ast_gr
 
 | Arg | Default | Purpose |
 |---|---|---|
-| `paths` | whole worktree | Files/dirs to include in the **output** map. The PageRank graph is always built from the whole worktree, then the map is personalized toward these. |
-| `globs` | — | Include/exclude globs for the output map (`!` prefix to exclude). |
+| `paths` | whole worktree | Files/dirs to include in the **output** map AND to seed Personalized PageRank toward. The worktree graph is always built from all code files; `paths` biases the ranking. |
+| `globs` | — | Include/exclude globs for the output map (`!` prefix to exclude). Also contributes to PPR seed construction. |
 | `lang` | — | Restrict to one language (`ts`, `tsx`, `js`, `py`, `go`, `rs`, `cpp`). |
 | `max_tokens` | 1024 | Token budget for the rendered map (×8 when no `paths`/`globs` given). |
-| `mentioned_idents` | — | Symbol names to boost in ranking (aider "mentioned_idents"). |
-| `refresh` | `auto` | `auto` = reuse the cached graph if no sources changed; `always` = rebuild. |
-| `json` | false | Return the persisted graph JSON (nodes, edges, scores, rankedSymbols) instead of the rendered map. |
+| `mentioned_idents` | — | Symbol names to boost in ranking. Each ident seeds files whose path components include the ident (aider "mentioned_idents" heuristic). |
+| `refresh` | `auto` | `auto` = reuse the cached worktree graph if the source manifest (mtime+size) is unchanged AND the scope snapshot is fresh; `always` = rebuild. |
+| `json` | false | Return the persisted v2 cache payload (version, worktreeGraph, scopes[], nextEpoch) as JSON instead of the rendered map. |
 
 ### Output format
 
 Path is shown once per file; each symbol is its declaration + a right-aligned range:
 
 ```
-.opencode/ast-grep-map-impl.ts:
-   L64-L69  function languageForFile(absPath: string): string | null {
-      L195  interface GraphEdge { src: string; dst: string; weight: number; ident: string }
-  L217-L259  function buildGraph(input: BuildInput): Graph {
+src/ast-grep-map/impl.ts:
+   L217-L259  function buildGraph(input: BuildInput): Graph {
+   L269-L336  function pageRank(
+       L410  function renderTree(rankedTags: RankedTag[]): string {
 ```
 
 Distinct symbols that share a source line (e.g. an object literal's shorthand methods, or a type with an inline method) render distinctly using each symbol's own text.
 
+### Scope-overlay + Personalized PageRank
+
+When `paths`, `globs`, or `mentioned_idents` are given, the worktree PageRank graph is reused but the personalization vector is rebuilt from those files (each matching file becomes a weight-1 seed). This is **Personalized PageRank** — symbols in or near the scoped files surface higher than they would under uniform personalization. The resulting rank snapshot is cached per-scope in `graph.json`'s `scopes[]` array, keyed by `{paths, globs}` + the seed fingerprint, so the next call with the same scope reuses it without re-running PPR.
+
+Unscoped calls (`paths`/`globs`/`mentioned_idents` all empty) skip PPR entirely and use the uniform-personalization scores stored in the worktree graph cache — byte-identical to the pre-PPR-output behavior.
+
+For debug/exploration, the `OP_AST_GREP_MAP_SEED_PATHS` env var (`;`,`,` or newline-separated workspace-relative paths) injects additional weight-1 seeds tagged `source: "debug-seed-path"` into every scope's PPR.
+
 ### Notes
 
-- The graph is cached at `<worktree>/.ast-grep/graph.json` (gitignored). `refresh:"auto"` skips rebuilding when source mtimes are unchanged — cheap to re-run.
-- PageRank reproduces networkx defaults (damping 0.85, 100 iterations, tol 1e-6) with personalization toward the scoped files.
+- The graph is cached at `<worktree>/.ast-grep/graph.json` (gitignored, schema v2). `refresh:"auto"` skips rebuilding when the source manifest (mtime+size) is unchanged — cheap to re-run.
+- **Auto-invalidation on edits.** The plugin subscribes to `file.edited`, `file.watcher.updated`, and `tool.execute.after` (for `edit`/`write` tools). Each edit flips the matching scope snapshot's `refreshState.stale` flag (cheap; no rebuild). The next `ast_grep_map` call detects stale state and rebuilds only what's needed. The worktree graph itself is manifest-gated (mtime+size) so edits outside any cached scope trigger a manifest mismatch on the next call and rebuild the worktree graph.
+- PageRank reproduces networkx defaults (damping 0.85, 100 iterations, tol 1e-6); PPR overlays use the same defaults.
 - Token counting uses a `length/4` proxy (no model tokenizer in the plugin).
+- The cache schema is v2 (older v1 caches are rejected on read with a one-time stderr hint; the first call after upgrade rebuilds from scratch).
 
 ---
 

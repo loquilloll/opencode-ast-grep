@@ -774,7 +774,7 @@ function resolveRoot(ctx: Pick<ToolContext, "directory" | "worktree">, langFilte
 
 const ast_grep_map = tool({
   description:
-    "Produce an aider-style code map (real source lines under │/⋮ box-drawing) ranked by PageRank, for the scoped files. Builds the PageRank graph from ALL code files in the worktree, personalizes toward the scoped files, and persists the graph to <worktree>/.ast-grep/graph.json. Uses tree-sitter + aider's -tags.scm queries (supports ts, tsx, js, py, go, rs, cpp).",
+    "Aider-style compact outline map (path shown once per file, each symbol rendered as its declaration line with a right-aligned L<n> or L<start>-L<end> range) ranked by PageRank over the worktree's reference graph. When paths/globs/mentioned_idents are given, runs Personalized PageRank biased toward those files (scope-keyed rank snapshot cached alongside the worktree graph at <worktree>/.ast-grep/graph.json). Auto-invalidates on file edits via the file.edited / file.watcher.updated / tool.execute.after hooks. Uses tree-sitter + aider's -tags.scm queries (supports ts, tsx, js, py, go, rs, cpp).",
   args: {
     paths: tool.schema.array(tool.schema.string()).optional().describe("Files/dirs to include in the OUTPUT map (default: whole worktree)."),
     globs: tool.schema.array(tool.schema.string()).optional().describe("Include/exclude globs for OUTPUT map files (prefix '!' to exclude)."),

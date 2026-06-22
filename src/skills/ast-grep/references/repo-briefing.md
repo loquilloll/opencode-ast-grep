@@ -42,8 +42,14 @@ Every relationship in the report is **EXTRACTED via AST** (tree-sitter def/ref
 captures). There is no inference step, no LLM, no semantic guesswork. The
 multi-definer list is the closest thing to an "ambiguity" signal.
 
-The report reflects whatever was on disk when `session.created` fired. If the
-user has since changed files, either:
+The report reflects whatever was on disk when `session.created` fired. The
+plugin subscribes to `file.edited`, `file.watcher.updated`, and
+`tool.execute.after` (for `edit`/`write` tools); each edit flips the matching
+scope snapshot's stale flag (cheap; no rebuild) so the next `ast_grep_map`
+call rebuilds only what's needed. The worktree graph itself is manifest-gated
+(mtime+size), so an edit that changes any tracked file triggers a rebuild on
+the next call automatically. If you want to force a refresh of REPORT.md
+without editing a file:
 
 - Call `ast_grep_map` with `refresh: "always"` to force a rebuild, or
 - Delete `.ast-grep/graph.json` and restart opencode.
