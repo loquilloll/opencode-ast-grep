@@ -288,6 +288,29 @@ function testNulIdentRejection(): void {
   assert(evilRanked?.worktreeGraph.rankedSymbols[0]?.ident === "legit", "legit rankedSymbol preserved")
 }
 
+// --- Test 8: stale schema cache is rejected quietly ---
+function testStaleSchemaReadIsQuiet(): void {
+  console.log("[8] stale schema cache rejected quietly")
+  const worktree = mkdtempSync(join(tmpdir(), "agmap-store-v1-"))
+  process.env.OP_AST_GREP_MAP_DIR = worktree
+  writeFileSync(join(worktree, "graph.json"), JSON.stringify({ version: 1 }), "utf8")
+
+  const originalErr = console.error
+  let stderr = ""
+  console.error = (...args: unknown[]) => {
+    stderr += `${args.join(" ")}\n`
+  }
+  try {
+    const readBack = readPersistedGraphCache(worktree)
+    assert(readBack === null, "v1 payload rejected")
+    assert(stderr === "", "v1 rejection does not emit stderr")
+  } finally {
+    console.error = originalErr
+    rmSync(worktree, { recursive: true, force: true })
+    delete process.env.OP_AST_GREP_MAP_DIR
+  }
+}
+
 // --- main ---
 ;(() => {
   testRoundtrip()
@@ -297,6 +320,7 @@ function testNulIdentRejection(): void {
   testStableSerialization()
   testScopeRoundtrip()
   testNulIdentRejection()
+  testStaleSchemaReadIsQuiet()
   console.log(failures === 0 ? "\nALL TESTS PASSED" : `\n${failures} TEST(S) FAILED`)
   process.exit(failures === 0 ? 0 : 1)
 })()

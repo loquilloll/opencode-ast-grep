@@ -389,19 +389,6 @@ export function readPersistedGraphCache(worktree: string): PersistedCache | null
   } catch {
     return null
   }
-  // One-time migration hint: a v1 cache is now unreadable (breaking schema
-  // bump). The first call after upgrade will rebuild from scratch; emit a
-  // stderr hint so the brief latency is not a mystery.
-  if (parsed && typeof parsed === "object" && (parsed as { version?: unknown }).version === 1) {
-    try {
-      console.error(
-        `[opencode-ast-grep] .ast-grep/graph.json is v1; ignoring and rebuilding as v2. ` +
-          `Delete the file or run ast_grep_map with refresh:"always" to silence this.`,
-      )
-    } catch {
-      /* console.error itself can throw in rare runtimes; ignore */
-    }
-  }
   return validatePersistedCache(parsed)
 }
 

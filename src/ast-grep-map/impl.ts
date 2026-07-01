@@ -11,7 +11,7 @@
 // Runtime deps: `node:` builtins only (no native modules). The opencode plugin
 // runs inside opencode's bundled runtime where tree-sitter's N-API addons may
 // not load, so ALL tree-sitter work is delegated to a standalone `node`
-// subprocess (.opencode/ast-grep-map-extract.mjs) — same pattern the sibling
+// subprocess (src/ast-grep-map/extract.mjs, shipped as a sibling of impl.js) — same pattern the sibling
 // ast-grep plugin uses (it shells out to the `sg` binary). This module only
 // spawns that subprocess + builds the graph + PageRank + renders.
 
@@ -146,7 +146,7 @@ function normalizeLangFilter(langFilter?: string): string | undefined {
 // ---------------------------------------------------------------------------
 // Tag extraction via the standalone Node subprocess
 // ---------------------------------------------------------------------------
-// All tree-sitter work runs in .opencode/ast-grep-map-extract.mjs under a real
+// All tree-sitter work runs in extract.mjs (sibling of impl.js) under a real
 // `node` process (the plugin's own runtime may be bundled and unable to load
 // tree-sitter's native N-API addons). We feed it absolute file paths via stdin
 // and read back a JSON array of tags from stdout.
@@ -171,7 +171,12 @@ function resolveExtractScript(worktree: string): string | null {
   if (envScript && existsSync(envScript)) return envScript
   const candidates: string[] = []
   try {
-    candidates.push(join(dirname(fileURLToPath(import.meta.url)), EXTRACT_SCRIPT_INSTALLED_NAME))
+    // The build ships extract.mjs as a sibling of impl.js (scripts/copy-assets.mjs
+    // copies it to dist/ast-grep-map/extract.mjs). Accept the natural name first,
+    // then the legacy renamed form so either bundle layout resolves.
+    const here = dirname(fileURLToPath(import.meta.url))
+    candidates.push(join(here, EXTRACT_SCRIPT_NAME))
+    candidates.push(join(here, EXTRACT_SCRIPT_INSTALLED_NAME))
   } catch {
     /* import.meta.url is always available in opencode, but keep resolution best-effort. */
   }
