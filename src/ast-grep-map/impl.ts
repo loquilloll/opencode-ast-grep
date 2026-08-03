@@ -17,6 +17,7 @@
 
 import { spawn } from "node:child_process"
 import { readFileSync, readdirSync, lstatSync, existsSync, mkdirSync, writeFileSync, renameSync } from "node:fs"
+import { homedir } from "node:os"
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 import { tool, type Plugin, type ToolContext } from "@opencode-ai/plugin"
@@ -125,6 +126,14 @@ const IGNORE_DIRS = new Set([
   "node_modules", ".git", ".hg", ".svn", ".ast-grep", ".opencode", ".sandcastle",
   "dist", "build", "target", ".next", ".cache", "out", "vendor", ".venv", "venv",
   "__pycache__", ".mypy_cache", ".pytest_cache", "coverage",
+  // Vendored / third-party source trees (often multi-MB generated C/C++).
+  "third_party", "thirdparty",
+  // Build workspaces created by `sona` (whisper.cpp/ggml clone + Vulkan shader
+  // dispatch generators). A single .sona-build tree can add 800+ files and
+  // 100MB+ of generated .cpp, blowing the extraction timeout.
+  ".sona-build",
+  // Cargo registry cache (root-level ~/.cargo mirror can appear in worktree).
+  ".cargo",
 ])
 
 // ---------------------------------------------------------------------------
@@ -196,6 +205,56 @@ function resolveNode(): string {
   return process.env[NODE_ENV_KEY] || "node"
 }
 
+// Build a hint listing the directories that contributed the most files to the
+// extraction input, so a timeout error can point at the likely culprits
+// (vendored trees, build workspaces, etc.). Counts each unique directory NAME
+// anywhere under the worktree — e.g. `.sona-build` is flagged whether it lives
+// at the worktree root or nested under apps/foo/.sona-build.
+function extractionTimeoutHint(files: string[], worktree: string): string {
+  if (files.length === 0) return ""
+  const dirCounts = new Map<string, number>()
+  for (const f of files) {
+    let rel: string
+    try {
+      rel = relative(worktree, f)
+    } catch {
+      continue
+    }
+    // Skip paths that failed to relativize (different drive / outside worktree).
+    if (!rel || rel === f || isAbsolute(rel)) continue
+    const parts = rel.split(sep)
+    const seen = new Set<string>()
+    // Count each unique directory name once per file (a file under
+    // a/b/.sona-build/x.cpp increments .sona-build once, not twice).
+    for (const part of parts.slice(0, -1)) {
+      if (part && !seen.has(part)) {
+        seen.add(part)
+        dirCounts.set(part, (dirCounts.get(part) ?? 0) + 1)
+      }
+    }
+  }
+  // Only flag dirs that account for >= 2% of files (and at least 10) —
+  // otherwise noisy small dirs dominate the list on large repos.
+  const threshold = Math.max(10, Math.ceil(files.length * 0.02))
+  const top = Array.from(dirCounts.entries())
+    .filter(([, c]) => c >= threshold)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+  if (top.length === 0) return ""
+  const lines = top.map(([name, count]) => `    - ${name}/ (${count} of ${files.length} files)`)
+  return (
+    `\n  Largest directories in extraction input — pass paths/globs to scope the call away from them, or add the names to IGNORE_DIRS in src/ast-grep-map/impl.ts:\n` +
+    lines.join("\n")
+  )
+}
+
+function buildTimeoutError(files: string[], worktree: string): Error {
+  const secs = EXTRACT_TIMEOUT_MS / 1000
+  const base = `ast-grep-map extraction timed out after ${secs}s (${files.length} files).`
+  const hint = extractionTimeoutHint(files, worktree)
+  return new Error(hint ? base + hint : base)
+}
+
 async function extractAllTags(worktree: string, files: string[], signal: AbortSignal): Promise<Tag[]> {
   const script = resolveExtractScript(worktree)
   if (!script) {
@@ -253,10 +312,10 @@ async function extractAllTags(worktree: string, files: string[], signal: AbortSi
     }
     child.on("error", (e: Error) => {
       stderr += `\nspawn error: ${e.message}`
-      finish(timedOut ? new Error(`ast-grep-map extraction timed out after ${EXTRACT_TIMEOUT_MS / 1000}s.`) : e)
+      finish(timedOut ? buildTimeoutError(files, worktree) : e)
     })
     child.on("close", (code: number | null) => {
-      if (timedOut) return finish(new Error(`ast-grep-map extraction timed out after ${EXTRACT_TIMEOUT_MS / 1000}s.`))
+      if (timedOut) return finish(buildTimeoutError(files, worktree))
       if (code !== 0 && code !== null) {
         return finish(new Error(`ast-grep-map extractor exited with code ${code}.${stderr.trim() ? `\n${stderr.trim()}` : ""}`))
       }
@@ -394,6 +453,12 @@ function binarySearchTokenBudget(rankedTags: RankedTag[], maxTokens: number): st
 // ---------------------------------------------------------------------------
 
 function discoverCodeFiles(root: string, langFilter?: string): string[] {
+  // Hard guard: never walk the user's home directory. Home is not a project;
+  // indexing it (e.g. when home is itself a git repo and opencode reports it
+  // as the worktree) is always wrong and catastrophically slow. Subdirectories
+  // of home (real projects under ~/...) are still walked — only home itself
+  // is refused.
+  if (isHomeDir(root)) return []
   const out: string[] = []
   const stack: string[] = [root]
   const normalizedLang = normalizeLangFilter(langFilter)
@@ -661,6 +726,23 @@ function usableRoot(root: string | undefined): string | null {
 function isSameOrInside(child: string, parent: string): boolean {
   const rel = relative(parent, child)
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))
+}
+
+// Resolved once at module load so the per-scan home guard is a cheap compare.
+// Pure string math — homedir() reads env/OS and resolve() normalizes
+// ./../separators; neither touches disk.
+const HOME_RESOLVED = resolve(homedir())
+
+// True only when `root` IS the user's home directory (case-insensitive on
+// Windows so C:\Users\alvins / c:\users\alvins / git's C:/Users/alvins all
+// match). Does NOT match subdirectories — real projects nested under ~/...
+// are still graphed normally. Intentionally an exact-match check (not
+// isSameOrInside, which would also match paths inside home).
+function isHomeDir(root: string): boolean {
+  const r = resolve(root)
+  return process.platform === "win32"
+    ? r.toLowerCase() === HOME_RESOLVED.toLowerCase()
+    : r === HOME_RESOLVED
 }
 
 // ---------------------------------------------------------------------------
@@ -1376,6 +1458,10 @@ export async function maybeRefreshReport(
   worktree: string,
   opts: { force?: boolean; signal?: AbortSignal } = {},
 ): Promise<RefreshResult> {
+  // Hard guard: never index the user's home directory. Must precede
+  // resolveMapDir (which side-effects via canWriteDir and would create
+  // home/.ast-grep) and the report rebuild (which would walk all of home).
+  if (isHomeDir(worktree)) return { status: "skipped" }
   const mapDir = resolveMapDir(worktree)
   try {
     mkdirSync(mapDir, { recursive: true })
@@ -1496,6 +1582,7 @@ export {
   languageForFile,
   resolveExtractScript,
   resolveRoot,
+  isHomeDir,
   buildScopeSeeds,
   applyScopedRanking,
   applyScopeScores,

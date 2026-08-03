@@ -38,6 +38,7 @@ test/                      test suites (run with tsx)
   ast-grep/                smoke + truncation suites
   ast-grep-map/            smoke + report + graph-store + graph-lifecycle + ppr
                            + ppr-wiring + cache-hit-scoped + compose-hooks + symlink
+                           + home-guard
   mcp/                     registry + hermetic runTool + InMemoryTransport round-trip
 scripts/copy-assets.mjs    copies extract.mjs + queries into dist/ after tsc
 .opencode/plugins/ast-grep.ts   thin shim opencode scans; re-exports src/plugin
@@ -49,7 +50,7 @@ scripts/copy-assets.mjs    copies extract.mjs + queries into dist/ after tsc
 ```bash
 npm install --legacy-peer-deps   # --legacy-peer-deps required for tree-sitter grammars
 npm run typecheck                # tsc, no emit (covers src + test + shim)
-npm test                         # all 12 test suites (tsx runner; hermetic)
+npm test                         # all 13 test suites (tsx runner; hermetic)
 npm run build                    # tsc src -> dist + copy assets
 npm run mcp                      # run the MCP server over stdio (after build)
 npm run test:mcp                 # MCP bridge smoke (registry + runTool + round-trip)
