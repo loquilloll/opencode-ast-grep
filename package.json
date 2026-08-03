@@ -2,11 +2,15 @@
   "name": "opencode-ast-grep",
   "private": true,
   "type": "module",
-  "description": "ast-grep + aider-style repo-map tools for opencode (search, replace, scan, validate, map).",
+  "description": "ast-grep + aider-style repo-map tools for opencode (search, replace, scan, validate, map), plus a standalone MCP server for any MCP client.",
+  "bin": {
+    "ast-grep-mcp": "dist/mcp/stdio.js"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.build.json && node scripts/copy-assets.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "tsx test/ast-grep/smoke.ts && tsx test/ast-grep/truncation.ts && tsx test/ast-grep-map/smoke.ts && tsx test/ast-grep-map/report.ts && tsx test/ast-grep-map/graph-store.ts && tsx test/ast-grep-map/graph-lifecycle.ts && tsx test/ast-grep-map/ppr.ts && tsx test/ast-grep-map/ppr-wiring.ts && tsx test/ast-grep-map/cache-hit-scoped.ts && tsx test/ast-grep-map/compose-hooks.ts && tsx test/ast-grep-map/symlink.ts",
+    "mcp": "node dist/mcp/stdio.js",
+    "test": "tsx test/ast-grep/smoke.ts && tsx test/ast-grep/truncation.ts && tsx test/ast-grep-map/smoke.ts && tsx test/ast-grep-map/report.ts && tsx test/ast-grep-map/graph-store.ts && tsx test/ast-grep-map/graph-lifecycle.ts && tsx test/ast-grep-map/ppr.ts && tsx test/ast-grep-map/ppr-wiring.ts && tsx test/ast-grep-map/cache-hit-scoped.ts && tsx test/ast-grep-map/compose-hooks.ts && tsx test/ast-grep-map/symlink.ts && tsx test/mcp/smoke.ts",
     "test:ast-grep": "tsx test/ast-grep/smoke.ts",
     "test:ast-grep-truncation": "tsx test/ast-grep/truncation.ts",
     "test:ast-grep-map": "tsx test/ast-grep-map/smoke.ts",
@@ -18,6 +22,7 @@
     "test:ast-grep-map-cache-hit-scoped": "tsx test/ast-grep-map/cache-hit-scoped.ts",
     "test:ast-grep-map-compose-hooks": "tsx test/ast-grep-map/compose-hooks.ts",
     "test:ast-grep-map-symlink": "tsx test/ast-grep-map/symlink.ts",
+    "test:mcp": "tsx test/mcp/smoke.ts",
     "sandcastle": "tsx .sandcastle/main.ts",
     "sandcastle:run": "tsx .sandcastle/main.ts run",
     "sandcastle:setup": "tsx .sandcastle/main.ts setup",
@@ -25,6 +30,7 @@
     "sandcastle:brew": "tsx .sandcastle/main.ts brew"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "@opencode-ai/plugin": "1.17.8",
     "tree-sitter": "^0.25.0",
     "tree-sitter-cpp": "^0.23.4",
