@@ -1,6 +1,6 @@
 # opencode-ast-grep
 
-Five AST tools for [opencode](https://opencode.ai), plus the `ast-grep` agent skill.
+Five AST tools for [opencode](https://opencode.ai), plus the `ast-grep` agent skill — **and the same five tools exposed as a standalone [MCP](https://modelcontextprotocol.io) server** (`ast-grep-mcp`) that works in any MCP client: Claude Code, Codex CLI, GitHub Copilot, Cursor, Cline, opencode, and more.
 
 | Tool | What it does |
 |---|---|
@@ -44,6 +44,67 @@ src/ast-grep-map/impl.ts:
 
 First use of the four `sg` tools auto-downloads the `ast-grep` binary (`0.43.0`) to `.opencode/runtime/`; `ast_grep_map` needs no binary (it uses the tree-sitter deps installed above).
 
+## MCP server (Claude Code, Codex CLI, Copilot, …)
+
+The same five tools also run as a **standalone stdio MCP server** — no opencode required. The server reuses the tool definitions verbatim and synthesizes a tool context from the resolved project root + per-request abort signal; `sg` binary provisioning and the tree-sitter extraction run as self-contained Node subprocesses.
+
+### Run it
+
+```bash
+npm run build
+npm run mcp                                  # uses process.cwd() as the root
+node dist/mcp/stdio.js --directory /path/to/project
+node dist/mcp/stdio.js --help                # prints to stderr (never stdout)
+```
+
+Project-root resolution: `--directory` / `-d` CLI arg → `OP_AST_GREP_MCP_DIRECTORY` env var → `process.cwd()`. The server also honors the tuning knobs in the env table below (`OMO_AST_GREP_SG_PATH`, `OP_AST_GREP_MAP_DIR`, …). stdio is reserved for the JSON-RPC protocol — all diagnostics go to stderr.
+
+> **Destructive tools:** over MCP there is no host permission layer. `ast_grep_replace{apply:true}` and `ast_grep_scan{apply:true}` modify files on disk directly; their descriptions carry an explicit warning so the model confirms first. The other three tools are read-only.
+
+### Client config snippets
+
+`<REPO>` = this repo's absolute path. The binary is `node <REPO>/dist/mcp/stdio.js` (or the `ast-grep-mcp` bin after `npm install -g` / `npm link`).
+
+**Claude Code:**
+```bash
+claude mcp add ast-grep -- node <REPO>/dist/mcp/stdio.js
+# scoped to a project, with an explicit root:
+claude mcp add ast-grep -s project -- node <REPO>/dist/mcp/stdio.js --directory $(pwd)
+```
+
+**Codex CLI** (`~/.codex/config.toml`):
+```toml
+[mcp_servers.ast-grep]
+command = "node"
+args = ["<REPO>/dist/mcp/stdio.js"]
+```
+
+**GitHub Copilot** (`.github/copilot-mcp-config.json`):
+```json
+{
+  "mcpServers": {
+    "ast-grep": {
+      "type": "local",
+      "command": "node",
+      "args": ["<REPO>/dist/mcp/stdio.js"],
+      "env": {},
+      "tools": ["*"]
+    }
+  }
+}
+```
+
+**opencode** (`opencode.json`):
+```json
+{
+  "mcp": {
+    "ast-grep": { "type": "local", "command": ["node", "<REPO>/dist/mcp/stdio.js"], "enabled": true }
+  }
+}
+```
+
+Cursor / Cline / Claude Desktop use the same `command: "node"`, `args: ["<REPO>/dist/mcp/stdio.js"]` shape. The Node 24 tree-sitter caveat in Development below still applies to `ast_grep_map`.
+
 ## Project structure
 
 ```
@@ -58,8 +119,14 @@ src/                         all TypeScript source
   ast-grep-map/graph-plugin.ts  re-export seam for runtime/build consumers
   ast-grep-map/extract.mjs   tree-sitter tag extractor (runs as a node subprocess)
   ast-grep-map/queries/      vendored aider -tags.scm query files
+  mcp/server.ts              transport-agnostic MCP server factory (bridges the 5 tools)
+  mcp/stdio.ts               CLI entry (bin: ast-grep-mcp); shebang; stdio transport
   skills/ast-grep/           the skill (SKILL.md + references + helper script)
-test/                        11 test suites (run with tsx)
+test/                        13 test suites (run with tsx)
+  ast-grep/                  smoke + truncation suites
+  ast-grep-map/              smoke + report + graph-store + graph-lifecycle + ppr + ppr-wiring
+                             + cache-hit-scoped + compose-hooks + symlink + home-guard
+  mcp/                       registry + hermetic runTool + InMemoryTransport round-trip + stdio
 scripts/copy-assets.mjs      copies extract.mjs + queries into dist/ on build
 .opencode/plugins/ast-grep.ts   thin shim opencode scans; re-exports src/plugin
 .opencode/skills/ast-grep       symlink -> src/skills/ast-grep (opencode scans here)
@@ -97,7 +164,7 @@ Node 24's V8 requires C++20 but tree-sitter's `binding.gyp` ships pinned to C++1
 | Script | Purpose |
 |---|---|
 | `npm run typecheck` | `tsc --noEmit` over `src/` + `test/` + the `.opencode` shim. |
-| `npm test` | Runs all 11 test suites via `tsx` (hermetic; some need network for sg provisioning). |
+| `npm test` | Runs all 13 test suites via `tsx` (hermetic; some need network for sg provisioning). |
 | `npm run test:ast-grep` | Just the ast-grep smoke suite. |
 | `npm run test:ast-grep-truncation` | Just the byte-cap + JSON-repair suite. |
 | `npm run test:ast-grep-map` | Just the ast-grep-map smoke suite. |
@@ -109,7 +176,10 @@ Node 24's V8 requires C++20 but tree-sitter's `binding.gyp` ships pinned to C++1
 | `npm run test:ast-grep-map-cache-hit-scoped` | Cache-hit + PPR overlay regression (defTags reconstruction). |
 | `npm run test:ast-grep-map-compose-hooks` | Plugin hook composition suite. |
 | `npm run test:ast-grep-map-symlink` | Symlink rejection suite (Windows skips when Developer Mode is off). |
+| `npm run test:ast-grep-map-home-guard` | Home-dir guard + extraction-timeout-hint suite. |
+| `npm run test:mcp` | MCP bridge smoke: registry + hermetic runTool + InMemoryTransport round-trip + stdio discipline. |
 | `npm run build` | `tsc` `src/` -> `dist/` + copies `extract.mjs` and `queries/`. |
+| `npm run mcp` | Run the standalone MCP server over stdio (`node dist/mcp/stdio.js`). |
 
 ### How opencode loads the code
 
@@ -134,10 +204,10 @@ See [`AGENTS.md`](./AGENTS.md) for the full list.
 ## Testing
 
 ```bash
-npm test          # all 11 suites (hermetic, except sg-binary provisioning on first run)
+npm test          # all 13 suites (hermetic, except sg-binary provisioning on first run)
 ```
 
-Tests run on `.ts` source via the `tsx` runner (no compile step). The default `npm test` runs ten suites:
+Tests run on `.ts` source via the `tsx` runner (no compile step). The default `npm test` runs thirteen suites:
 
 **`test/ast-grep/smoke.ts`** — end-to-end in a temp dir: search finds a match; replace dry-runs then applies; scan finds/no-matches/rejects bad config; validate flags regex misuse. *Requires the `sg` binary*, which auto-provisions from GitHub on first use (network).
 
@@ -161,6 +231,10 @@ Tests run on `.ts` source via the `tsx` runner (no compile step). The default `n
 
 **`test/ast-grep-map/symlink.ts`** — `isSeedPathSymlink` on regular file; `discoverCodeFiles` skips symlinked files + dirs; `normalizeSeedEntries` rejects symlinked seeds. Windows self-skips when Developer Mode is off.
 
+**`test/ast-grep-map/home-guard.ts`** — `isHomeDir` (case-insensitive on Windows); `discoverCodeFiles` refuses to walk the user's home directory; `resolveRoot` falls back past home; `maybeRefreshReport` skips home.
+
+**`test/mcp/smoke.ts`** — MCP bridge: registry shape (5 tools, descriptions, args); hermetic `runTool` on `ast_grep_validate`; end-to-end `tools/list` + `tools/call` over `InMemoryTransport` (required-field + mutation-warning conversion); `normalizeToolResult` (`{error}` → `isError`); `--help` writes 0 bytes to stdout.
+
 ### Convergence / determinism
 
 `ast_grep_map` PageRank is deterministic across runs and its scores sum to 1.0 (asserted in the smoke suite). The persisted cache (`<worktree>/.ast-grep/graph.json`, gitignored, schema v2) is rebuilt automatically by `refresh:"auto"` whenever the source manifest (mtime+size) changes, and scope snapshots are invalidated incrementally on `file.edited` / `tool.execute.after` edit-write hooks.
@@ -171,7 +245,7 @@ Tests run on `.ts` source via the `tsx` runner (no compile step). The default `n
 npm run build        # tsc src -> dist (+ copies extract.mjs + queries/)
 ```
 
-`dist/` is gitignored. For a published package, point consumers at `dist/` (e.g. add it to a consumer's `opencode.json` `"plugin"` array, or ship as an npm package consumed by name).
+`dist/` is gitignored. The build also emits `dist/mcp/stdio.js` (the `ast-grep-mcp` bin entry; shebang preserved on line 1, so it's directly executable). For a published package, point consumers at `dist/` (e.g. add it to a consumer's `opencode.json` `"plugin"` array, register `dist/mcp/stdio.js` as an MCP server per the snippets above, or ship as an npm package consumed by name).
 
 ## Environment variables
 
@@ -183,3 +257,4 @@ npm run build        # tsc src -> dist (+ copies extract.mjs + queries/)
 | `OP_AST_GREP_MAP_SCRIPT` | Override the extract.mjs path (used by tests). |
 | `OP_AST_GREP_MAP_NODE` | Override the `node` binary used to spawn the extractor. |
 | `OP_AST_GREP_MAP_SEED_PATHS` | Debug seeds for PPR — `;`,`,` or newline-separated workspace-relative paths. |
+| `OP_AST_GREP_MCP_DIRECTORY` | MCP server: project root when `--directory` is not given (default `process.cwd()`). |
