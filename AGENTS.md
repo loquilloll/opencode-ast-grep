@@ -94,38 +94,35 @@ The Node 24 tree-sitter caveat above still applies: `ast_grep_map` spawns the sa
 
 ### Client config snippets
 
-The binary is `node <repo>/dist/mcp/stdio.js` (or the `ast-grep-mcp` bin after `npm install -g` / `npm link`). Below, `<REPO>` = this repo's absolute path.
+The binary is `node <REPO>/dist/mcp/stdio.js` (or the `ast-grep-mcp` bin after `npm install -g` / `npm link`), where `<REPO>` = this repo's absolute path. Append `--directory <project>` to pin the root. See README.md → "Setup by client" for step-by-step (incl. verification) for each.
 
-**Claude Code** (CLI):
-```bash
-claude mcp add ast-grep -- node <REPO>/dist/mcp/stdio.js
-# scoped to a project, with an explicit root:
-claude mcp add ast-grep -s project -- node <REPO>/dist/mcp/stdio.js --directory $(pwd)
+**opencode** — `opencode.json` (project) or `~/.config/opencode/opencode.json`:
+```json
+{ "mcp": { "ast-grep": { "type": "local", "command": ["node", "<REPO>/dist/mcp/stdio.js"], "enabled": true } } }
 ```
+Or `opencode mcp add ast-grep -- node <REPO>/dist/mcp/stdio.js`. Verify with `/mcp`.
 
-**Codex CLI** — add to `~/.codex/config.toml`:
+**Claude Code** — options before the name, `--` before the launch command:
+```bash
+claude mcp add --scope project ast-grep -- node <REPO>/dist/mcp/stdio.js
+```
+(`--scope` is `local` default / `project` shared via `.mcp.json` / `user` global.)
+
+**Codex CLI** — `~/.codex/config.toml`:
 ```toml
 [mcp_servers.ast-grep]
 command = "node"
 args = ["<REPO>/dist/mcp/stdio.js"]
 ```
+Or `codex mcp add ast-grep -- node <REPO>/dist/mcp/stdio.js`.
 
-**GitHub Copilot** — `.github/copilot-mcp-config.json` in the repo:
+**GitHub Copilot (VS Code)** — `.vscode/mcp.json` (note the `servers` key, not `mcpServers`):
 ```json
-{
-  "mcpServers": {
-    "ast-grep": {
-      "type": "local",
-      "command": "node",
-      "args": ["<REPO>/dist/mcp/stdio.js"],
-      "env": {},
-      "tools": ["*"]
-    }
-  }
-}
+{ "servers": { "ast-grep": { "command": "node", "args": ["<REPO>/dist/mcp/stdio.js"] } } }
 ```
+Copilot CLI / Agent Host read `~/.copilot/mcp-config.json` (same `servers` shape).
 
-**Cursor / Cline / opencode / Claude Desktop** — same shape: `command: "node"`, `args: ["<REPO>/dist/mcp/stdio.js"]` (Claude Desktop's `claude_desktop_config.json` uses `command`/`args`; opencode's MCP config uses `command`/`args`/`env`).
+**Cursor / Cline / Claude Desktop** — same `command: "node"`, `args: ["<REPO>/dist/mcp/stdio.js"]` shape in their respective config files.
 
 ### Relationship to the global-install bundle
 

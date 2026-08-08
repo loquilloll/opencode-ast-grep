@@ -61,49 +61,70 @@ Project-root resolution: `--directory` / `-d` CLI arg → `OP_AST_GREP_MCP_DIREC
 
 > **Destructive tools:** over MCP there is no host permission layer. `ast_grep_replace{apply:true}` and `ast_grep_scan{apply:true}` modify files on disk directly; their descriptions carry an explicit warning so the model confirms first. The other three tools are read-only.
 
-### Client config snippets
+### Setup by client
 
-`<REPO>` = this repo's absolute path. The binary is `node <REPO>/dist/mcp/stdio.js` (or the `ast-grep-mcp` bin after `npm install -g` / `npm link`).
+Pick your client. Each assumes you've run `npm run build` and uses `<REPO>` for this repo's absolute path (run `pwd` / `echo %CD%` in the repo to copy it; on Windows use the full `C:\...\dist\mcp\stdio.js` path, double-backslashed in JSON). Append `--directory <project>` to any launch command to pin the project root explicitly.
 
-**Claude Code:**
-```bash
-claude mcp add ast-grep -- node <REPO>/dist/mcp/stdio.js
-# scoped to a project, with an explicit root:
-claude mcp add ast-grep -s project -- node <REPO>/dist/mcp/stdio.js --directory $(pwd)
-```
-
-**Codex CLI** (`~/.codex/config.toml`):
-```toml
-[mcp_servers.ast-grep]
-command = "node"
-args = ["<REPO>/dist/mcp/stdio.js"]
-```
-
-**GitHub Copilot** (`.github/copilot-mcp-config.json`):
+#### opencode
+opencode reads MCP servers from `opencode.json` (project root) or `~/.config/opencode/opencode.json` (global):
 ```json
 {
-  "mcpServers": {
+  "mcp": {
     "ast-grep": {
       "type": "local",
-      "command": "node",
-      "args": ["<REPO>/dist/mcp/stdio.js"],
-      "env": {},
-      "tools": ["*"]
+      "command": ["node", "<REPO>/dist/mcp/stdio.js", "--directory", "<your-project>"],
+      "enabled": true
     }
   }
 }
 ```
+Or via the CLI (writes the same config):
+```bash
+opencode mcp add ast-grep -- node <REPO>/dist/mcp/stdio.js --directory <your-project>
+```
+**Verify:** launch `opencode` in the project and run `/mcp` → `ast-grep connected ✓`. *(Verified against opencode v1.18.5.)*
 
-**opencode** (`opencode.json`):
+#### GitHub Copilot (VS Code)
+VS Code / Copilot Chat reads MCP servers from `.vscode/mcp.json` in the workspace (commit it to share with your team):
 ```json
 {
-  "mcp": {
-    "ast-grep": { "type": "local", "command": ["node", "<REPO>/dist/mcp/stdio.js"], "enabled": true }
+  "servers": {
+    "ast-grep": {
+      "command": "node",
+      "args": ["<REPO>/dist/mcp/stdio.js", "--directory", "${workspaceFolder}"]
+    }
   }
 }
 ```
+`${workspaceFolder}` is a VS Code variable resolved at launch to the open workspace. Reload the window after saving; the first start prompts you to **trust** the server.
+**Verify:** open Chat → **Configure Tools** → the five `ast_grep_*` tools are listed. *(Copilot CLI / the Agent Host instead read `~/.copilot/mcp-config.json` or a workspace `.mcp.json` with the same `servers` shape.)*
 
-Cursor / Cline / Claude Desktop use the same `command: "node"`, `args: ["<REPO>/dist/mcp/stdio.js"]` shape. The Node 24 tree-sitter caveat in Development below still applies to `ast_grep_map`.
+#### Claude Code
+Use the CLI — options come **before** the name; `--` separates Claude's config from the launch command:
+```bash
+# project-scoped (shared via .mcp.json) — recommended; server inherits the project as cwd:
+claude mcp add --scope project ast-grep -- node <REPO>/dist/mcp/stdio.js
+# user-scoped (all your projects) — pin an explicit root:
+claude mcp add --scope user ast-grep -- node <REPO>/dist/mcp/stdio.js --directory /path/to/project
+```
+**Verify:** `claude mcp list` shows `ast-grep ✓ connected`; in a session the tools appear as `mcp__ast-grep__ast_grep_*`.
+
+#### Codex CLI
+Codex reads MCP servers from `~/.codex/config.toml`:
+```toml
+[mcp_servers.ast-grep]
+command = "node"
+args = ["<REPO>/dist/mcp/stdio.js", "--directory", "/path/to/project"]
+```
+Or via the CLI (everything after `--` is the launch command):
+```bash
+codex mcp add ast-grep -- node <REPO>/dist/mcp/stdio.js --directory /path/to/project
+```
+**Verify:** `codex mcp list` shows the server; the tools are available in the next session.
+
+---
+
+**Cursor, Cline, Claude Desktop** use the same shape — `command: "node"`, `args: ["<REPO>/dist/mcp/stdio.js"]` — in their respective MCP config files. The Node 24 tree-sitter caveat in Development below still applies to `ast_grep_map`.
 
 ## Project structure
 
