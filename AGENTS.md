@@ -2,6 +2,8 @@
 
 Guidance for AI agents working in this repo.
 
+> **Don't duplicate README content here.** This file is for agent/dev-specific guidance — build constraints, lifecycle hooks, invariants an editor must preserve, internal workflows (e.g. the global-install deploy), and orientation. User-facing material (setup, usage, per-client MCP config, the tool table, env-var reference) lives in [`README.md`](./README.md). When adding to AGENTS.md, link to README instead of restating it; when README gains a section, prune the overlap from here.
+
 ## What this is
 
 An opencode plugin package providing five AST tools:
@@ -76,64 +78,17 @@ npm rebuild tree-sitter
 
 ## MCP server
 
-`src/mcp/` exposes the same five tools as a **standalone stdio MCP server** so they work in any MCP client — Claude Code, Codex CLI, GitHub Copilot, Cursor, Cline, opencode — without opencode installed. The bridge reuses the tool definitions from `ast-grep/impl.ts` and `ast-grep-map/impl.ts` verbatim (the `tool()` helper is an identity fn), synthesizing a `ToolContext` from the resolved project root + the per-request abort signal. No opencode hooks/lifecycle run; `sg` binary provisioning and the `extract.mjs` tree-sitter subprocess are the same self-contained Node code paths the plugin uses.
-
-### Run it
-
-```bash
-npm run build
-npm run mcp                                    # uses process.cwd() as the root
-node dist/mcp/stdio.js --directory /path/to/project
-node dist/mcp/stdio.js --help                  # prints to stderr (never stdout)
-node dist/mcp/stdio.js --trace                 # one-line stderr trace per tool call
-```
-
-Root resolution order: `--directory` / `-d` CLI arg → `OP_AST_GREP_MCP_DIRECTORY` env var → `process.cwd()`. The server also honors the repo's other tuning knobs (`OMO_AST_GREP_SG_PATH`, `OP_AST_GREP_MAP_DIR`, `OP_AST_GREP_MAP_NODE`, `OP_AST_GREP_MAP_SCRIPT`).
-
-The Node 24 tree-sitter caveat above still applies: `ast_grep_map` spawns the same `extract.mjs` subprocess, so a fresh `npm install` on Node 24 needs the C++20 binding patch before the map tool works.
-
-### Client config snippets
-
-The binary is `node <REPO>/dist/mcp/stdio.js` (or the `ast-grep-mcp` bin after `npm install -g` / `npm link`), where `<REPO>` = this repo's absolute path. Append `--directory <project>` to pin the root. See README.md → "Setup by client" for step-by-step (incl. verification) for each.
-
-**opencode** — `opencode.json` (project) or `~/.config/opencode/opencode.json`:
-```json
-{ "mcp": { "ast-grep": { "type": "local", "command": ["node", "<REPO>/dist/mcp/stdio.js"], "enabled": true } } }
-```
-Or `opencode mcp add ast-grep -- node <REPO>/dist/mcp/stdio.js`. Verify with `/mcp`.
-
-**Claude Code** — options before the name, `--` before the launch command:
-```bash
-claude mcp add --scope project ast-grep -- node <REPO>/dist/mcp/stdio.js
-```
-(`--scope` is `local` default / `project` shared via `.mcp.json` / `user` global.)
-
-**Codex CLI** — `~/.codex/config.toml`:
-```toml
-[mcp_servers.ast-grep]
-command = "node"
-args = ["<REPO>/dist/mcp/stdio.js"]
-```
-Or `codex mcp add ast-grep -- node <REPO>/dist/mcp/stdio.js`.
-
-**GitHub Copilot (VS Code)** — `.vscode/mcp.json` (note the `servers` key, not `mcpServers`):
-```json
-{ "servers": { "ast-grep": { "command": "node", "args": ["<REPO>/dist/mcp/stdio.js"] } } }
-```
-Copilot CLI / Agent Host read `~/.copilot/mcp-config.json` (same `servers` shape).
-
-**Cursor / Cline / Claude Desktop** — same `command: "node"`, `args: ["<REPO>/dist/mcp/stdio.js"]` shape in their respective config files.
+`src/mcp/` also exposes the same five tools as a **standalone stdio MCP server** (bin `ast-grep-mcp`) for any MCP client. **Run instructions, root-resolution order, and per-client setup/verification are in [README.md](./README.md) → "MCP server"** — don't restate them here. What's agent-relevant: the bridge reuses the impl modules' tool definitions verbatim (`tool()` is an identity fn) and synthesizes a `ToolContext`; no opencode hooks/lifecycle run, so `sg` provisioning and the `extract.mjs` subprocess are the same self-contained Node paths the plugin uses.
 
 ### Relationship to the global-install bundle
 
 The opencode global-install workflow (robocopy `dist/` → `~/.config/opencode/ast-grep-bundle/`) also ships `dist/mcp/`, so the MCP server is available there too (e.g. `node ~/.config/opencode/ast-grep-bundle/mcp/stdio.js`). Standalone MCP use does **not** require the opencode bundle — `node <repo>/dist/mcp/stdio.js` after `npm run build` is sufficient, and the grammar deps resolve from this repo's root `node_modules`.
 
-### Architecture constraints
+### Build / editing constraints
 
-- **stdio is reserved for the JSON-RPC protocol.** The tool execute paths write nothing to stdout (grep-verified); all diagnostics (help text, missing-directory warnings, fatal errors, `--trace` lines) go to stderr.
-- **No host permission layer — destructive tools warn via their description.** Unlike opencode (which gates destructive tool calls in an outer permission step), an MCP host generally does not intercept tool calls. `ast_grep_replace{apply:true}` and `ast_grep_scan{apply:true}` therefore modify files on disk directly. The MCP bridge appends an explicit "will modify files on disk — confirm with the user first" note to those two tools' descriptions so the calling LM surfaces the side effect; `ast_grep_search` / `ast_grep_validate` / `ast_grep_map` are read-only.
-- **Extensionless `.js` specifiers** in `src/mcp/*` so `tsc -p tsconfig.build.json` emits `dist/mcp/`.
-- tsc preserves the `#!/usr/bin/env node` shebang in `dist/mcp/stdio.js` (line 1), so the bin entry is directly executable.
+- `src/mcp/*.ts` uses **extensionless `.js` specifiers** (hard constraint #3) so `tsc -p tsconfig.build.json` emits `dist/mcp/`. tsc preserves the `#!/usr/bin/env node` shebang on line 1 of `dist/mcp/stdio.js`, so the bin is directly executable.
+- **stdio is reserved for the JSON-RPC protocol** — the tool execute paths write nothing to stdout (grep-verified); all diagnostics (help, warnings, `--trace`, fatal errors) go to stderr via the injected `log`. Preserve this when editing.
+- **Destructive tools warn via their description.** No host permission layer intercepts MCP tool calls, so `ast_grep_replace{apply:true}` / `ast_grep_scan{apply:true}` mutate files directly. The bridge appends a "modifies files on disk" warning to those tools' descriptions (`MUTATING_TOOLS` in `src/mcp/server.ts`); preserve/extend that set if a new tool gains a destructive mode. The other three tools are read-only.
 
 ## Update the global install
 
