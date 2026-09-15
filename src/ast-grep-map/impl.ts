@@ -16,7 +16,7 @@
 // spawns that subprocess + builds the graph + PageRank + renders.
 
 import { spawn } from "node:child_process"
-import { readFileSync, readdirSync, lstatSync, existsSync, mkdirSync, writeFileSync, renameSync } from "node:fs"
+import { readFileSync, readdirSync, lstatSync, existsSync, mkdirSync, writeFileSync, renameSync, unlinkSync, statSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -874,95 +874,106 @@ const ast_grep_map = tool({
   execute: async (args, ctx) => {
     const worktree = resolveRoot(ctx, args.lang)
     const refresh = args.refresh ?? "auto"
-
-    // 1. Discover all code files (graph set).
-    const allFiles = discoverCodeFiles(worktree, args.lang)
-    if (allFiles.length === 0) {
-      return `No supported code files found under ${worktree}. (Supported: ts, tsx, js, py, go, rs, cpp)`
-    }
-
-    // 2. Scope (output map target / personalization focus).
-    const scopeFiles = matchScope(allFiles, worktree, args.paths, args.globs)
-    const mentionedIdents = new Set(args.mentioned_idents ?? [])
-    const scopeGiven =
-      !!(args.paths && args.paths.length) ||
-      !!(args.globs && args.globs.length) ||
-      !!(args.mentioned_idents && args.mentioned_idents.length)
-
-    // 3. Capture source manifest (mtime+size) for cache validity.
-    const relFiles = allFiles.map((f) => relative(worktree, f))
-    const sourceManifest = captureSourceManifest(worktree, relFiles) ?? []
-
-    // 4. Hydrate lifecycle state once per process.
-    await initializeGraphPlugin(worktree)
-
-    // 5. Try refresh:"auto" — reuse persisted worktree graph if manifest unchanged.
-    const persisted = getWorktreeGraphCache(worktree)
-    const cacheHit =
-      refresh === "auto" &&
-      !!persisted &&
-      manifestsEqual(persisted.worktreeGraph.sourceManifest, sourceManifest)
-
-    if (cacheHit && persisted) {
-      // Reuse the cached worktree graph. The PPR scope overlay is layered on
-      // top — when scope is given, look up (or derive+persist) the scope
-      // snapshot and re-rank. Without this, scoped cache-hit calls would
-      // silently return uniform-personalization output.
-      const rankedUniform: RankedTag[] = persisted.worktreeGraph.rankedSymbols.map((r) => ({
-        tag: rankedSymbolToTag(r),
-        rank: r.rank,
-      }))
-      // Reconstruct defTags (the input to rankDefinitions) from the cache's
-      // rankedSymbols. Without this, applyScopeScores would receive an empty
-      // defTags array and return an empty re-ranking — the cache-hit scoped
-      // path would render "(no ranked symbols to display)" even on a fully
-      // populated cache. Each ranked symbol's tag IS a def tag (kind: "def").
-      const cachedDefTags: Tag[] = rankedUniform.map((rt) => rt.tag)
-      // Reconstruct a minimal Graph object sufficient for applyScopeScores
-      // (which only needs .nodes and .edges + .outWeight). The cache stores
-      // them; outWeight is recomputed from edges cheaply.
-      const cachedGraph: Graph = {
-        nodes: persisted.worktreeGraph.graph.nodes,
-        edges: persisted.worktreeGraph.graph.edges,
-        outWeight: computeOutWeight(persisted.worktreeGraph.graph.edges),
+    const reportMapDir = resolveMapDir(worktree)
+    // Every map path can write graph.json (worktree graph or scope snapshot),
+    // so all calls share the report transaction lock. This keeps graph.json
+    // paired with REPORT.md when refresh:"always" publishes both artifacts.
+    const reportLockToken = await acquireReportLockWithWait(reportMapDir)
+    if (!reportLockToken) throw new Error("timed out waiting for graph/report lock")
+    try {
+      // 1. Discover all code files (graph set).
+      const allFiles = discoverCodeFiles(worktree, args.lang)
+      if (allFiles.length === 0) {
+        return `No supported code files found under ${worktree}. (Supported: ts, tsx, js, py, go, rs, cpp)`
       }
-      const ranked = await applyScopedRanking(worktree, cachedGraph, cachedDefTags, rankedUniform, args)
+
+      // 2. Scope (output map target / personalization focus).
+      const scopeFiles = matchScope(allFiles, worktree, args.paths, args.globs)
+      const mentionedIdents = new Set(args.mentioned_idents ?? [])
+      const scopeGiven =
+        !!(args.paths && args.paths.length) ||
+        !!(args.globs && args.globs.length) ||
+        !!(args.mentioned_idents && args.mentioned_idents.length)
+
+      // 3. Capture source manifest (mtime+size) for cache validity.
+      const relFiles = allFiles.map((f) => relative(worktree, f))
+      const sourceManifest = captureSourceManifest(worktree, relFiles) ?? []
+
+      // 4. Hydrate lifecycle state once per process.
+      await initializeGraphPlugin(worktree)
+
+      // 5. Try refresh:"auto" — reuse persisted worktree graph if manifest unchanged.
+      const persisted = getWorktreeGraphCache(worktree)
+      const cacheHit =
+        refresh === "auto" &&
+        !!persisted &&
+        manifestsEqual(persisted.worktreeGraph.sourceManifest, sourceManifest)
+
+      if (cacheHit && persisted) {
+        // Reuse the cached worktree graph. The PPR scope overlay is layered on
+        // top — when scope is given, look up (or derive+persist) the scope
+        // snapshot and re-rank. Without this, scoped cache-hit calls would
+        // silently return uniform-personalization output.
+        const rankedUniform: RankedTag[] = persisted.worktreeGraph.rankedSymbols.map((r) => ({
+          tag: rankedSymbolToTag(r),
+          rank: r.rank,
+        }))
+        // Reconstruct defTags (the input to rankDefinitions) from the cache's
+        // rankedSymbols. Without this, applyScopeScores would receive an empty
+        // defTags array and return an empty re-ranking — the cache-hit scoped
+        // path would render "(no ranked symbols to display)" even on a fully
+        // populated cache. Each ranked symbol's tag IS a def tag (kind: "def").
+        const cachedDefTags: Tag[] = rankedUniform.map((rt) => rt.tag)
+        // Reconstruct a minimal Graph object sufficient for applyScopeScores
+        // (which only needs .nodes and .edges + .outWeight). The cache stores
+        // them; outWeight is recomputed from edges cheaply.
+        const cachedGraph: Graph = {
+          nodes: persisted.worktreeGraph.graph.nodes,
+          edges: persisted.worktreeGraph.graph.edges,
+          outWeight: computeOutWeight(persisted.worktreeGraph.graph.edges),
+        }
+        const ranked = await applyScopedRanking(worktree, cachedGraph, cachedDefTags, rankedUniform, args)
+        const maxTokens = (args.max_tokens ?? DEFAULT_MAX_TOKENS) * (scopeGiven ? 1 : MAP_MUL_NO_FILES)
+        if (args.json) return JSON.stringify(persisted, null, 2)
+        const tree = binarySearchTokenBudget(ranked, maxTokens)
+        return formatResult(tree)
+      }
+
+      // 6. Cache miss — extract tags and rebuild the worktree graph.
+      const resolved = await resolveWorktreeGraph(worktree, allFiles, scopeFiles, mentionedIdents, ctx.abort)
+      if ("error" in resolved) return resolved.error
+      const { graph, defTags, ranked: rankedUniform, scores } = resolved
+
+      // 7. Persist worktree graph FIRST so scope snapshots layered on top survive.
+      //    This was the root cause of three critical bugs in the first review:
+      //    persistGraphAsCache replaces state.cache with a fresh payload (scopes: []),
+      //    so any scope snapshot written before this step gets clobbered.
+      const cache = persistGraphAsCache(
+        worktree,
+        graph,
+        scores,
+        rankedUniform,
+        sourceManifest,
+        Array.from(mentionedIdents),
+      )
+      if (refresh === "always")
+        writeReportAtomic(reportMapDir, generateReport(cacheToGraphView(cache), { worktree }))
+      if (args.json) {
+        return JSON.stringify(cache, null, 2)
+      }
+
+      // 8. Now layer the scope-aware PPR ranking on top of the freshly persisted
+      //    worktree graph. persistScopedRankSnapshot writes into the same cache
+      //    payload installed in step 7, so the snapshot survives.
+      const ranked = await applyScopedRanking(worktree, graph, defTags, rankedUniform, args)
+
+      // 9. Render to token budget.
       const maxTokens = (args.max_tokens ?? DEFAULT_MAX_TOKENS) * (scopeGiven ? 1 : MAP_MUL_NO_FILES)
-      if (args.json) return JSON.stringify(persisted, null, 2)
       const tree = binarySearchTokenBudget(ranked, maxTokens)
       return formatResult(tree)
+    } finally {
+      if (reportLockToken) releaseReportLock(reportMapDir, reportLockToken)
     }
-
-    // 6. Cache miss — extract tags and rebuild the worktree graph.
-    const resolved = await resolveWorktreeGraph(worktree, allFiles, scopeFiles, mentionedIdents, ctx.abort)
-    if ("error" in resolved) return resolved.error
-    const { graph, defTags, ranked: rankedUniform, scores } = resolved
-
-    // 7. Persist worktree graph FIRST so scope snapshots layered on top survive.
-    //    This was the root cause of three critical bugs in the first review:
-    //    persistGraphAsCache replaces state.cache with a fresh payload (scopes: []),
-    //    so any scope snapshot written before this step gets clobbered.
-    const cache = persistGraphAsCache(
-      worktree,
-      graph,
-      scores,
-      rankedUniform,
-      sourceManifest,
-      Array.from(mentionedIdents),
-    )
-    if (args.json) {
-      return JSON.stringify(cache, null, 2)
-    }
-
-    // 8. Now layer the scope-aware PPR ranking on top of the freshly persisted
-    //    worktree graph. persistScopedRankSnapshot writes into the same cache
-    //    payload installed in step 7, so the snapshot survives.
-    const ranked = await applyScopedRanking(worktree, graph, defTags, rankedUniform, args)
-
-    // 9. Render to token budget.
-    const maxTokens = (args.max_tokens ?? DEFAULT_MAX_TOKENS) * (scopeGiven ? 1 : MAP_MUL_NO_FILES)
-    const tree = binarySearchTokenBudget(ranked, maxTokens)
-    return formatResult(tree)
   },
 })
 
@@ -990,10 +1001,17 @@ const REPORT_ORPHAN_SAMPLE_N = 5
 const REPORT_ORPHAN_TABLE_CAP = 20
 const REPORT_MAX_MODULE_EDGES = 30
 const REPORT_LOCK_STALE_MS = 5 * 60 * 1000
+const REPORT_LOCK_MALFORMED_STALE_MS = REPORT_LOCK_STALE_MS
 const REPORT_FILE = "REPORT.md"
 const REPORT_TMP = "REPORT.md.tmp"
 const REPORT_LOCK_FILE = ".report.lock"
 const REPORT_LOG_FILE = "report.log"
+
+// Tokens of locks currently held by THIS process. acquireReportLock writes a
+// unique token (pid + ts + random) with flag "wx"; releaseReportLock only
+// unlinks when the file still contains our exact token. The set lets
+// reportLockOwnerIsAlive distinguish our own live locks from a recycled pid.
+const activeReportLockTokens = new Set<string>()
 
 export interface Hub {
   file: string
@@ -1357,47 +1375,98 @@ function reportLogLine(mapDir: string, msg: string): void {
   }
 }
 
-function acquireReportLock(mapDir: string): boolean {
+function acquireReportLock(mapDir: string): string | false {
   const lockPath = join(mapDir, REPORT_LOCK_FILE)
+  mkdirSync(mapDir, { recursive: true })
   try {
-    if (existsSync(lockPath)) {
+    // Unique token: pid + timestamp + random suffix. "wx" fails atomically
+    // (EEXIST) when another process already holds the lock.
+    const token = `${process.pid}\u0000${Date.now()}\u0000${Math.random().toString(16).slice(2)}`
+    writeFileSync(lockPath, token, { flag: "wx" })
+    activeReportLockTokens.add(token)
+    return token
+  } catch (error: any) {
+    if (error?.code !== "EEXIST") return false
+    try {
       const raw = readFileSync(lockPath, "utf8").trim()
       const [pidStr, tsStr] = raw.split("\u0000")
       const ts = Number(tsStr)
-      if (Number.isFinite(ts) && Date.now() - ts < REPORT_LOCK_STALE_MS) {
-        return false // active lock held by another process
+      // Malformed lock (e.g. crashed mid-write): break it only once it is old
+      // enough that no live writer could still be replacing it.
+      const malformedAndOld =
+        !Number.isFinite(ts) && Date.now() - statSync(lockPath).mtimeMs >= REPORT_LOCK_MALFORMED_STALE_MS
+      // Stale lock whose owner process is dead: safe to break.
+      const ownerPid = Number(pidStr)
+      const staleAndDead =
+        Number.isFinite(ts) && Date.now() - ts >= REPORT_LOCK_STALE_MS && !reportLockOwnerIsAlive(ownerPid, raw)
+      if (staleAndDead || malformedAndOld) {
+        unlinkSync(lockPath)
+        return acquireReportLock(mapDir)
       }
+    } catch {
+      /* another process may be replacing the lock */
     }
-    mkdirSync(mapDir, { recursive: true })
-    writeFileSync(lockPath, `${process.pid}\u0000${Date.now()}`)
-    return true
-  } catch {
     return false
   }
 }
 
-function releaseReportLock(mapDir: string): void {
+// Best-effort liveness check for a lock owner. Our own pid is matched against
+// activeReportLockTokens (a recycled pid cannot fake our random token
+// suffix); other pids via signal 0.
+function reportLockOwnerIsAlive(pid: number, token: string): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  if (pid === process.pid) return activeReportLockTokens.has(token)
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error: any) {
+    return error?.code !== "ESRCH"
+  }
+}
+
+// Poll for the report lock so serialized callers (session.created hook vs
+// ast_grep_map execute) wait out the holder instead of failing fast.
+async function acquireReportLockWithWait(mapDir: string): Promise<string | false> {
+  const deadline = Date.now() + REPORT_LOCK_STALE_MS
+  while (Date.now() < deadline) {
+    const token = acquireReportLock(mapDir)
+    if (token) return token
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 25))
+  }
+  return false
+}
+
+function releaseReportLock(mapDir: string, token: string): void {
   try {
     const lockPath = join(mapDir, REPORT_LOCK_FILE)
     if (existsSync(lockPath)) {
       const raw = readFileSync(lockPath, "utf8").trim()
-      const [pidStr] = raw.split("\u0000")
-      if (pidStr === String(process.pid)) writeFileSync(lockPath, "")
+      // Token match: only the owner deletes the lock, so a stale-break race
+      // cannot delete a lock a fresher process already re-acquired.
+      if (raw === token) unlinkSync(lockPath)
     }
   } catch {
     /* ignore */
+  } finally {
+    activeReportLockTokens.delete(token)
   }
 }
 
 function writeReportAtomic(mapDir: string, markdown: string): string {
   const outPath = join(mapDir, REPORT_FILE)
-  const tmpPath = join(mapDir, REPORT_TMP)
+  // Unique tmp name: concurrent processes never collide on the tmp file.
+  const tmpPath = join(mapDir, `${REPORT_TMP}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}`)
   mkdirSync(mapDir, { recursive: true })
   writeFileSync(tmpPath, markdown)
   try {
     renameSync(tmpPath, outPath)
-  } catch {
-    writeFileSync(outPath, markdown) // rename can fail across devices
+  } catch (error) {
+    try {
+      unlinkSync(tmpPath)
+    } catch {
+      /* best-effort cleanup */
+    }
+    throw error
   }
   return outPath
 }
@@ -1456,7 +1525,7 @@ async function rebuildGraphForReport(worktree: string, signal: AbortSignal): Pro
 
 export async function maybeRefreshReport(
   worktree: string,
-  opts: { force?: boolean; signal?: AbortSignal } = {},
+  opts: { force?: boolean; signal?: AbortSignal; waitForLock?: boolean } = {},
 ): Promise<RefreshResult> {
   // Hard guard: never index the user's home directory. Must precede
   // resolveMapDir (which side-effects via canWriteDir and would create
@@ -1468,8 +1537,12 @@ export async function maybeRefreshReport(
   } catch {
     /* may already exist */
   }
-  if (!acquireReportLock(mapDir)) {
-    return { status: "skipped", reportPath: join(mapDir, REPORT_FILE) }
+  const lockToken = opts.waitForLock ? await acquireReportLockWithWait(mapDir) : acquireReportLock(mapDir)
+  if (!lockToken) {
+    const reportPath = join(mapDir, REPORT_FILE)
+    return existsSync(reportPath)
+      ? { status: "skipped", reportPath }
+      : { status: "failed", error: "timed out waiting for report lock" }
   }
   const signal = opts.signal ?? new AbortController().signal
   try {
@@ -1500,7 +1573,7 @@ export async function maybeRefreshReport(
     reportLogLine(mapDir, `FAILED: ${msg}`)
     return { status: "failed", error: msg }
   } finally {
-    releaseReportLock(mapDir)
+    releaseReportLock(mapDir, lockToken)
   }
 }
 
@@ -1520,14 +1593,12 @@ const astGrepMapPlugin: Plugin = async (input) => {
     tool: tools,
     event: async ({ event }) => {
       if (event.type === "session.created") {
-        // Fire-and-forget: do NOT await (session start must not block). Same
-        // pattern as ast-grep's sg-binary provisioning.
-        const handle = setTimeout(() => {
-          maybeRefreshReport(worktree).catch(() => {
-            /* errors are logged inside maybeRefreshReport */
-          })
-        }, 0)
-        handle.unref()
+        // The first primary-agent prompt must be able to read REPORT.md.
+        // Await the manifest check/build so session startup establishes
+        // that invariant before prompt work begins.
+        const result = await maybeRefreshReport(worktree, { waitForLock: true })
+        if (!existsSync(join(resolveMapDir(worktree), REPORT_FILE)))
+          throw new Error(result.error ?? "REPORT.md was not generated during session startup")
         return
       }
       // Improvement #1: file edits invalidate scope-keyed rank snapshots so the
