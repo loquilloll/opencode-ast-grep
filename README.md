@@ -143,7 +143,7 @@ src/                         all TypeScript source
   mcp/server.ts              transport-agnostic MCP server factory (bridges the 5 tools)
   mcp/stdio.ts               CLI entry (bin: ast-grep-mcp); shebang; stdio transport
   skills/ast-grep/           the skill (SKILL.md + references + helper script)
-test/                        13 test suites (run with tsx)
+test/                        14 test suites (run with tsx)
   ast-grep/                  smoke + truncation suites
   ast-grep-map/              smoke + report + graph-store + graph-lifecycle + ppr + ppr-wiring
                              + cache-hit-scoped + compose-hooks + symlink + home-guard
@@ -185,7 +185,7 @@ Node 24's V8 requires C++20 but tree-sitter's `binding.gyp` ships pinned to C++1
 | Script | Purpose |
 |---|---|
 | `npm run typecheck` | `tsc --noEmit` over `src/` + `test/` + the `.opencode` shim. |
-| `npm test` | Runs all 13 test suites via `tsx` (hermetic; some need network for sg provisioning). |
+| `npm test` | Runs all 14 test suites via `tsx` (hermetic; some need network for sg provisioning). |
 | `npm run test:ast-grep` | Just the ast-grep smoke suite. |
 | `npm run test:ast-grep-truncation` | Just the byte-cap + JSON-repair suite. |
 | `npm run test:ast-grep-map` | Just the ast-grep-map smoke suite. |

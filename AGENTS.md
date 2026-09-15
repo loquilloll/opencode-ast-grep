@@ -40,7 +40,7 @@ test/                      test suites (run with tsx)
   ast-grep/                smoke + truncation suites
   ast-grep-map/            smoke + report + graph-store + graph-lifecycle + ppr
                            + ppr-wiring + cache-hit-scoped + compose-hooks + symlink
-                           + home-guard
+                           + home-guard + empty-worktree
   mcp/                     registry + hermetic runTool + InMemoryTransport round-trip
 scripts/copy-assets.mjs    copies extract.mjs + queries into dist/ after tsc
 .opencode/plugins/ast-grep.ts   thin shim opencode scans; re-exports src/plugin
@@ -52,7 +52,7 @@ scripts/copy-assets.mjs    copies extract.mjs + queries into dist/ after tsc
 ```bash
 npm install --legacy-peer-deps   # --legacy-peer-deps required for tree-sitter grammars
 npm run typecheck                # tsc, no emit (covers src + test + shim)
-npm test                         # all 13 test suites (tsx runner; hermetic)
+npm test                         # all 14 test suites (tsx runner; hermetic)
 npm run build                    # tsc src -> dist + copy assets
 npm run mcp                      # run the MCP server over stdio (after build)
 npm run test:mcp                 # MCP bridge smoke (registry + runTool + round-trip)
@@ -138,7 +138,7 @@ Already-running opencode sessions won't pick up the new bundle until restart; ne
 
 The ast-grep-map plugin subscribes to:
 
-- `session.created` → background REPORT.md refresh (fire-and-forget, `unref`'d).
+- `session.created` → awaits `maybeRefreshReport(worktree, { waitForLock: true })` so REPORT.md exists before the first primary-agent prompt (the global `instructions/ast-grep-graph.md` contract). No-code worktrees take a pre-lock fast path: a stable stub REPORT.md is written (write-if-changed) and `status:"empty"` is returned; the hook logs one short line per worktree per process. A real generation failure throws ONCE per worktree per process; repeats are downgraded to one-liner `console.error`s (per-event, no stack) so a persistent failure can't spam every hook event.
 - `file.edited` / `file.watcher.updated` → `markStaleForPath(worktree, file)` — flips the matching scope snapshot's `refreshState.stale` flag and persists. Cheap; no rebuild. Falls back to `markWorkspaceStale` when the path is outside the worktree.
 - `tool.execute.after` (only for `edit` / `write` tools) → same invalidation. Reads `metadata.filepath` (or `metadata.filediff.file` for older opencode shapes).
 

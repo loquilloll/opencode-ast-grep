@@ -874,6 +874,15 @@ const ast_grep_map = tool({
   execute: async (args, ctx) => {
     const worktree = resolveRoot(ctx, args.lang)
     const refresh = args.refresh ?? "auto"
+
+    // 1. Discover all code files (graph set). No-code worktrees return before
+    //    any lock acquisition or mapDir side effects — ast_grep_map on a
+    //    docs-only worktree must be a cheap, side-effect-free no-op.
+    const allFiles = discoverCodeFiles(worktree, args.lang)
+    if (allFiles.length === 0) {
+      return `No supported code files found under ${worktree}. (Supported: ts, tsx, js, py, go, rs, cpp)`
+    }
+
     const reportMapDir = resolveMapDir(worktree)
     // Every map path can write graph.json (worktree graph or scope snapshot),
     // so all calls share the report transaction lock. This keeps graph.json
@@ -881,12 +890,6 @@ const ast_grep_map = tool({
     const reportLockToken = await acquireReportLockWithWait(reportMapDir)
     if (!reportLockToken) throw new Error("timed out waiting for graph/report lock")
     try {
-      // 1. Discover all code files (graph set).
-      const allFiles = discoverCodeFiles(worktree, args.lang)
-      if (allFiles.length === 0) {
-        return `No supported code files found under ${worktree}. (Supported: ts, tsx, js, py, go, rs, cpp)`
-      }
-
       // 2. Scope (output map target / personalization focus).
       const scopeFiles = matchScope(allFiles, worktree, args.paths, args.globs)
       const mentionedIdents = new Set(args.mentioned_idents ?? [])
@@ -1358,7 +1361,7 @@ export function generateReport(g: PersistedGraph, opts: ReportOptions = {}): str
 // .ast-grep/report.log — the hook must never crash the plugin load.
 // Concurrency: PID lockfile at .ast-grep/.report.lock. Stale after 5 minutes.
 
-export type RefreshStatus = "fresh" | "rebuilt" | "skipped" | "failed"
+export type RefreshStatus = "fresh" | "rebuilt" | "skipped" | "failed" | "empty"
 
 export interface RefreshResult {
   status: RefreshStatus
@@ -1471,9 +1474,38 @@ function writeReportAtomic(mapDir: string, markdown: string): string {
   return outPath
 }
 
-function currentSourceManifest(worktree: string): SourceManifestEntry[] {
-  const files = discoverCodeFiles(worktree).map((f) => relative(worktree, f))
-  return captureSourceManifest(worktree, files) ?? []
+// Stable (no-timestamp) stub written when the worktree has no supported code
+// files. Agents instructed to read .ast-grep/REPORT.md first get an explicit
+// "nothing to map" instead of a missing file, and the "REPORT.md exists after
+// session start" invariant holds for code-less worktrees too.
+function emptyReportMarkdown(worktree: string): string {
+  return [
+    "<!-- ast-grep-map report · no supported code files -->",
+    "",
+    `# Repo briefing — ${worktree}`,
+    "",
+    "No supported code files found under this worktree (supported: ts, tsx, js, py, go, rs, cpp).",
+    "Nothing to map; `ast_grep_map` will report the same. This placeholder keeps the",
+    '".ast-grep/REPORT.md exists on session start" invariant true for code-less worktrees.',
+    "",
+  ].join("\n")
+}
+
+// Write the stub only when content differs, so repeat sessions cause zero
+// mtime/report.log churn. Returns the REPORT.md path either way.
+function writeStubReportIfChanged(mapDir: string, worktree: string): string {
+  const reportPath = join(mapDir, REPORT_FILE)
+  const stub = emptyReportMarkdown(worktree)
+  let existing: string | null = null
+  try {
+    existing = readFileSync(reportPath, "utf8")
+  } catch {
+    /* absent — first write */
+  }
+  if (existing === stub) return reportPath
+  const written = writeReportAtomic(mapDir, stub)
+  reportLogLine(mapDir, "EMPTY: no supported code files; stub REPORT.md written")
+  return written
 }
 
 // Mirrors the ast_grep_map tool's execute path with no scope focus: whole-repo
@@ -1537,6 +1569,16 @@ export async function maybeRefreshReport(
   } catch {
     /* may already exist */
   }
+  // No supported code files is a normal worktree state (docs/config-only
+  // projects), not a failure. Fast path BEFORE any lock acquisition so a
+  // stale .report.lock can never delay boot on a worktree with nothing to
+  // index. Uses the discovered file list (not the manifest) so stat failures
+  // cannot misclassify a real worktree as empty.
+  const codeFiles = discoverCodeFiles(worktree)
+  if (codeFiles.length === 0) {
+    const reportPath = writeStubReportIfChanged(mapDir, worktree)
+    return { status: "empty", reportPath }
+  }
   const lockToken = opts.waitForLock ? await acquireReportLockWithWait(mapDir) : acquireReportLock(mapDir)
   if (!lockToken) {
     const reportPath = join(mapDir, REPORT_FILE)
@@ -1548,7 +1590,7 @@ export async function maybeRefreshReport(
   try {
     await initializeGraphPlugin(worktree)
     const persistedCache = getWorktreeGraphCache(worktree)
-    const currentManifest = currentSourceManifest(worktree)
+    const currentManifest = captureSourceManifest(worktree, codeFiles.map((f) => relative(worktree, f))) ?? []
     const unchanged =
       !!persistedCache && manifestsEqual(persistedCache.worktreeGraph.sourceManifest, currentManifest)
     const reportExists = existsSync(join(mapDir, REPORT_FILE))
@@ -1579,6 +1621,23 @@ export async function maybeRefreshReport(
 
 export const tools = { ast_grep_map }
 
+// Per-process, per-worktree session-startup outcomes: opencode `serve` fires
+// session.created per session in one long-lived process, so without dedupe a
+// persistent failure would re-throw / re-log a full stack on every event (the
+// no-code-worktree boot-wedge bug class). Shared across plugin-factory
+// invocations via the ESM module cache.
+const sessionStartupOutcomes = new Map<string, { emptyWarned?: boolean; failureThrown?: boolean }>()
+
+function startupOutcome(worktree: string): { emptyWarned?: boolean; failureThrown?: boolean } {
+  const key = resolve(worktree)
+  let s = sessionStartupOutcomes.get(key)
+  if (!s) {
+    s = {}
+    sessionStartupOutcomes.set(key, s)
+  }
+  return s
+}
+
 const astGrepMapPlugin: Plugin = async (input) => {
   const worktree = resolveRoot(input)
   // Initialize the lifecycle state (lazy once-per-process hydration of the
@@ -1597,8 +1656,28 @@ const astGrepMapPlugin: Plugin = async (input) => {
         // Await the manifest check/build so session startup establishes
         // that invariant before prompt work begins.
         const result = await maybeRefreshReport(worktree, { waitForLock: true })
-        if (!existsSync(join(resolveMapDir(worktree), REPORT_FILE)))
-          throw new Error(result.error ?? "REPORT.md was not generated during session startup")
+        if (result.status === "empty") {
+          // No-code worktree: not an error. One short line per worktree per
+          // process; repeat sessions stay completely quiet.
+          const st = startupOutcome(worktree)
+          if (!st.emptyWarned) {
+            st.emptyWarned = true
+            console.error(`[opencode-ast-grep] no supported code files under ${worktree}; wrote stub REPORT.md`)
+          }
+          return
+        }
+        if (!existsSync(join(resolveMapDir(worktree), REPORT_FILE))) {
+          const st = startupOutcome(worktree)
+          if (!st.failureThrown) {
+            st.failureThrown = true
+            throw new Error(result.error ?? "REPORT.md was not generated during session startup")
+          }
+          // Downgrade repeats to a one-liner so a persistent failure cannot
+          // spam every hook event with a multi-KB stack.
+          console.error(
+            `[opencode-ast-grep] REPORT.md generation still failing under ${worktree}: ${result.error ?? "unknown error"}`,
+          )
+        }
         return
       }
       // Improvement #1: file edits invalidate scope-keyed rank snapshots so the
