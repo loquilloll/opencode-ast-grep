@@ -11,6 +11,7 @@
 // two plugins' hook handlers are composed here and dispatched by event.type /
 // tool name inside each handler.
 
+import { tool } from "@opencode-ai/plugin"
 import type { Hooks, Plugin } from "@opencode-ai/plugin"
 import astGrepPlugin from "./ast-grep/impl.js"
 import astGrepMapPlugin from "./ast-grep-map/impl.js"
@@ -90,3 +91,80 @@ const plugin: Plugin = async (ctx) => {
 }
 
 export default plugin
+
+// ---------------------------------------------------------------------------
+// opencode 2.x promise-plugin setup
+//
+// opencode 2.x only loads a scanned file whose default export decodes as
+// `{ id, effect | setup }`; opencode 1.x accepts `{ id, server }` (its
+// PluginModule shape) or a bare function. The shims (repo-local
+// `.opencode/plugins/ast-grep.ts` and the global
+// `~/.config/opencode/plugins/ast-grep.ts`) therefore default-export
+// `{ id: "ast-grep", server: plugin, setup: v2Setup }` — 1.x calls `server`
+// with its PluginInput, 2.x calls `setup` with its plugin Context and ignores
+// the extra `server` key.
+//
+// This setup re-registers the same v1 tool definitions through v2's tool
+// editor: the JSON Schema input is generated from each tool's zod `args`
+// shape (zod 4 native toJSONSchema), the execute context is bridged (v2 has
+// no per-tool directory, so the plugin location stands in for both
+// `directory` and `worktree`), and string results are wrapped as v2
+// `content`. The v1 event hooks (session.created sg provisioning + REPORT.md
+// build, file-edit scope invalidation) have no v2 wiring here; map freshness
+// falls back to its mtime+size manifest and `refresh: "always"`.
+
+// Runtime shape of a v1 `tool({...})` definition. `tool()` is the identity
+// function, so this is exactly what the impl modules export.
+interface V1ToolDefinition {
+  readonly description: string
+  readonly args: Parameters<typeof tool.schema.object>[0]
+  execute: (args: any, ctx: { directory?: string; worktree?: string; abort?: AbortSignal }) => Promise<unknown>
+}
+
+// Structural subset of opencode 2.x's promise-plugin Context
+// (@opencode/plugin/promise/plugin.ts) and ToolEditor — enough to register
+// tools without depending on the v2 package.
+interface V2PluginContext {
+  readonly location: { readonly directory: string }
+  readonly tool: {
+    readonly transform: (callback: (editor: V2ToolEditor) => void) => Promise<unknown>
+  }
+}
+
+interface V2ToolEditor {
+  add(definition: {
+    name: string
+    description: string
+    input: unknown
+    options: { codemode: false }
+    execute: (input: any, context: { signal: AbortSignal }) => Promise<{ content: unknown; metadata?: unknown }>
+  }): void
+}
+
+// v1 tool results are strings in every path these tools take; keep the object
+// branch for the `{ title, output, metadata }` shape v1 allows.
+function toV2Result(result: unknown): { content: unknown; metadata?: unknown } {
+  if (typeof result === "string") return { content: result }
+  if (result && typeof result === "object" && "output" in result) {
+    const record = result as { output?: unknown; metadata?: unknown }
+    return { content: record.output, metadata: record.metadata }
+  }
+  return { content: result }
+}
+
+export const v2Setup = async (ctx: V2PluginContext) => {
+  const directory = ctx.location.directory
+  const hooks = await plugin({ directory, worktree: directory } as Parameters<Plugin>[0])
+  await ctx.tool.transform((editor) => {
+    for (const [name, definition] of Object.entries(hooks.tool ?? {}) as [string, V1ToolDefinition][]) {
+      editor.add({
+        name,
+        description: definition.description,
+        input: tool.schema.toJSONSchema(tool.schema.object(definition.args)),
+        options: { codemode: false },
+        execute: async (input, context) =>
+          toV2Result(await definition.execute(input, { directory, worktree: directory, abort: context.signal })),
+      })
+    }
+  })
+}

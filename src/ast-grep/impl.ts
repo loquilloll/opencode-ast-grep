@@ -2,7 +2,7 @@
 //
 // Single-file plugin: registers 4 tools (`ast_grep_search`, `ast_grep_replace`,
 // `ast_grep_scan`, `ast_grep_validate`) and auto-provisions the `sg`/`ast-grep`
-// binary (pinned 0.43.0). Behavior ported verbatim from oh-my-openagent's
+// binary (pinned 0.45.2). Behavior ported verbatim from oh-my-openagent's
 // vendored ast-grep skill (packages/utils/src/ast-grep/* and the Python helper).
 //
 // Runtime deps: `node:` builtins + `globalThis.fetch` only. Resolves
@@ -21,32 +21,32 @@ import { tool, type Plugin, type ToolContext } from "@opencode-ai/plugin"
 // 2. Constants
 // ---------------------------------------------------------------------------
 
-const SG_PINNED_VERSION = "0.43.0"
+const SG_PINNED_VERSION = "0.45.2"
 
 const SG_RELEASE_ASSETS = {
   "darwin-arm64": {
-    sha256: "8c847d0a29aa4b3101b3361e0b3ee7fb53c7e497adc9ed1afc9615538cd40782",
-    url: "https://github.com/ast-grep/ast-grep/releases/download/0.43.0/app-aarch64-apple-darwin.zip",
+    sha256: "1fc21214234bf6f5a3f841d5b2493a4fc4b6087f69b055c9ad5f94f77c0ab76e",
+    url: "https://github.com/ast-grep/ast-grep/releases/download/0.45.2/app-aarch64-apple-darwin.zip",
   },
   "darwin-x64": {
-    sha256: "6d703090b106747b2f56086b6ccc7e798fe78bcae70257aa20519b220153555b",
-    url: "https://github.com/ast-grep/ast-grep/releases/download/0.43.0/app-x86_64-apple-darwin.zip",
+    sha256: "037e5b4a9aed2ba03a2b4710e4fe3439d5d1154d1266d5e8f9f6df7452169181",
+    url: "https://github.com/ast-grep/ast-grep/releases/download/0.45.2/app-x86_64-apple-darwin.zip",
   },
   "linux-arm64": {
-    sha256: "e706846148493967f3ab8011334817edd86ce5acbec10718b2a7b40799c640ff",
-    url: "https://github.com/ast-grep/ast-grep/releases/download/0.43.0/app-aarch64-unknown-linux-gnu.zip",
+    sha256: "e67ee2f5928b4d77a472114edf6e227d90fefe22fa47e7a78db187c55d206564",
+    url: "https://github.com/ast-grep/ast-grep/releases/download/0.45.2/app-aarch64-unknown-linux-gnu.zip",
   },
   "linux-x64": {
-    sha256: "a26253a9c821d935f7e383e40f0de7c2ca62a4121de1f73a6d81ec32eae631e0",
-    url: "https://github.com/ast-grep/ast-grep/releases/download/0.43.0/app-x86_64-unknown-linux-gnu.zip",
+    sha256: "67aff72dd2994bf152fcc3a8a09cf93b13193abe59f39393095167c729af2015",
+    url: "https://github.com/ast-grep/ast-grep/releases/download/0.45.2/app-x86_64-unknown-linux-gnu.zip",
   },
   "win32-arm64": {
-    sha256: "a519fdd90324bf6858fde2d3feb2b862d67b834dc11af8f5b6c2c8143ab6a6c5",
-    url: "https://github.com/ast-grep/ast-grep/releases/download/0.43.0/app-aarch64-pc-windows-msvc.zip",
+    sha256: "2081ee4f8842a03ebc745967bb1bf0ed70edd4cde7858dfafae30fda07372bf3",
+    url: "https://github.com/ast-grep/ast-grep/releases/download/0.45.2/app-aarch64-pc-windows-msvc.zip",
   },
   "win32-x64": {
-    sha256: "a4febbc8c48671e5729d85e29e4ebe5a051b7250d19545bca18e725ccf40ef61",
-    url: "https://github.com/ast-grep/ast-grep/releases/download/0.43.0/app-x86_64-pc-windows-msvc.zip",
+    sha256: "e14c3e33c6813111a41b8e4307e13462ebb2fea783d17ae22fc50d32a04ea77d",
+    url: "https://github.com/ast-grep/ast-grep/releases/download/0.45.2/app-x86_64-pc-windows-msvc.zip",
   },
 } as const satisfies Record<string, { readonly sha256: string; readonly url: string }>
 
@@ -510,25 +510,42 @@ export function ensureProvisioned(targetDir: string): Promise<string> {
 
 async function getBinaryOrError(): Promise<{ binary: string } | { error: string }> {
   const targetDir = runtimeTargetDir()
-  let binary = findSgBinarySync({ runtimeDir: targetDir })
-  if (binary) return { binary }
+  const existing = findManagedSgBinary(targetDir)
+  if (existing) return { binary: existing }
   try {
-    await ensureProvisioned(targetDir)
+    // ensureProvisioned downloads the pinned version and renames it over any
+    // stale binary, so its return value is the fresh destination path.
+    return { binary: await ensureProvisioned(targetDir) }
   } catch (err) {
     return { error: missingBinaryMessage(err) }
   }
-  binary = findSgBinarySync({ runtimeDir: targetDir })
-  if (binary) return { binary }
-  return { error: missingBinaryMessage() }
 }
 
 function scheduleBackgroundProvision(): void {
   const targetDir = runtimeTargetDir()
-  if (findSgBinarySync({ runtimeDir: targetDir })) return
+  if (findManagedSgBinary(targetDir)) return
   const handle = setTimeout(() => {
     void ensureProvisioned(targetDir).catch(() => {})
   }, 0)
   handle.unref()
+}
+
+function isPinnedSgVersion(binaryPath: string): boolean {
+  try {
+    return defaultVersionProbe(binaryPath).includes(SG_PINNED_VERSION)
+  } catch {
+    return false
+  }
+}
+
+// The runtime dir is not version-keyed, so a previously provisioned binary can
+// lag the pin. Only the binary we provisioned there is version-managed: env
+// overrides and PATH hits are the user's explicit choice and are returned as-is.
+function findManagedSgBinary(targetDir: string): string | null {
+  const binary = findSgBinarySync({ runtimeDir: targetDir })
+  if (binary === null) return null
+  if (binary === join(targetDir, sgBinaryName()) && !isPinnedSgVersion(binary)) return null
+  return binary
 }
 
 function missingBinaryMessage(err?: unknown): string {

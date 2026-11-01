@@ -14,7 +14,7 @@ if (!existsSync(dest)) throw new Error(`binary not found at ${dest}`)
 const version = execFileSync(dest, ["--version"], { encoding: "utf8", timeout: 5_000 }).trim()
 console.log(`[e2e] --version => ${version}`)
 if (!version.toLowerCase().includes("ast-grep")) throw new Error(`--version lacks 'ast-grep': ${version}`)
-if (!version.includes("0.43.0")) throw new Error(`--version lacks 0.43.0: ${version}`)
+if (!version.includes("0.45.2")) throw new Error(`--version lacks 0.45.2: ${version}`)
 
 const resolved = findSgBinarySync({ runtimeDir: targetDir })
 console.log(`[e2e] resolver => ${resolved}`)

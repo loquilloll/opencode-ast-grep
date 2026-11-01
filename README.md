@@ -42,7 +42,7 @@ src/ast-grep-map/impl.ts:
        L410  function renderTree(rankedTags: RankedTag[]): string {
 ```
 
-First use of the four `sg` tools auto-downloads the `ast-grep` binary (`0.43.0`) to `.opencode/runtime/`; `ast_grep_map` needs no binary (it uses the tree-sitter deps installed above).
+First use of the four `sg` tools auto-downloads the `ast-grep` binary (`0.45.2`) to `.opencode/runtime/`; `ast_grep_map` needs no binary (it uses the tree-sitter deps installed above).
 
 ## MCP server (Claude Code, Codex CLI, Copilot, …)
 
@@ -157,7 +157,7 @@ tsconfig.build.json          emit config (src -> dist/)
 
 ## How it works
 
-- The four `sg` tools shell out to a provisioned `ast-grep` binary (auto-downloaded to `.opencode/runtime/` on first use, pinned `0.43.0`). Subprocess output is byte-capped at 1 MB: when the cap is hit the child is SIGTERM'd, partial JSON is salvaged via bracket-repair, and the formatted output is prefixed with `[TRUNCATED]` explaining the reason.
+- The four `sg` tools shell out to a provisioned `ast-grep` binary (auto-downloaded to `.opencode/runtime/` on first use, pinned `0.45.2`). Subprocess output is byte-capped at 1 MB: when the cap is hit the child is SIGTERM'd, partial JSON is salvaged via bracket-repair, and the formatted output is prefixed with `[TRUNCATED]` explaining the reason.
 - `ast_grep_map` delegates all tree-sitter work to a standalone `node` subprocess (`src/ast-grep-map/extract.mjs`), because tree-sitter's native N-API addons do not load inside opencode's bundled runtime. The plugin itself builds the reference graph, runs PageRank (networkx defaults: damping 0.85, 100 iterations, tol 1e-6), and renders a token-budgeted outline.
 - When `ast_grep_map` is called with `paths`/`globs`/`mentioned_idents`, a Personalized PageRank runs on the same worktree graph biased toward the scoped files. The resulting rank snapshot is cached per-scope in `graph.json`'s `scopes[]` array (keyed by `{paths, globs}` + seed fingerprint) so subsequent calls with the same scope reuse it. File edits invalidate the matching scope snapshot automatically via the `file.edited` / `tool.execute.after` hooks.
 
